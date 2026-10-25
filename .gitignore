@@ -1,5 +1,20 @@
+# 依赖与构建缓存
 node_modules/
 .wrangler/
 .dev.vars
+
+# 安装产物（keepalive.sh 装在仓库目录里时）
+.env
+.alert
+.installed
+install.conf
+pages-dist/
+
+# 本地工具产物
 *.log
 .DS_Store
+.workbuddy-ai/
+.playwright-mcp/
+
+# 说明：worker/dist/worker.js 是构建产物，但故意提交 ——
+# 网页面板部署要粘贴这份单文件，仓库里没有它就得多装一次 node。

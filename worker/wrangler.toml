@@ -2,6 +2,10 @@ name = "instabox-keepalive"
 main = "worker.js"
 compatibility_date = "2026-10-16"
 
+# main 指向源码 worker.js（它会 import ./ui.js 的面板 HTML，wrangler 会自动打包）。
+# 要粘到 Cloudflare 网页面板的单文件版本是构建产物 dist/worker.js：
+#   cd worker && npm run build        （等价于 node build.mjs）
+
 # 每 9 分钟续一次 15 分钟的租约（cron 最小粒度 1 分钟）
 # 注意 TTL 必须大于 cron 间隔，否则两次续租之间会空窗：间隔 9 分钟就填 900
 [triggers]
@@ -17,6 +21,13 @@ INSTABOX_LEASE_TTL = "900"
 INSTABOX_LOG_MODE = "hourly"
 # 机器被挂起/停掉后续租会 409 machine_not_running：默认先 resume（stopped 用 start 兜底）再续租，设 0 关掉
 INSTABOX_AUTO_RESUME = "1"
+# 唤醒后等机器变 running 的窗口：次数 × 间隔秒（默认 6×5 = 30 秒，机器启动慢就再放宽）
+WAKE_TRIES = "6"
+WAKE_GAP = "5"
+# 失败告警：webhook 地址里通常带密钥，用 `npx wrangler secret put ALERT_WEBHOOK` 存，别写在这里
+# ALERT_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/xxx"
+ALERT_FORMAT = "text"
+ALERT_MIN_INTERVAL = "1800"
 # 多账号：第 N 个账号 = 单账号变量名加 _N 后缀，加一个账号就多存一个 secret（别把 key 写进这个文件）：
 #   npx wrangler secret put INSTABOX_API_KEY_2      # 2 号账号
 #   npx wrangler secret put INSTABOX_API_KEY_3      # 3 号账号，依此类推
@@ -24,9 +35,34 @@ INSTABOX_AUTO_RESUME = "1"
 # 按顺序当 1、2、3 号账号）；两种写法混着用也行，显式 _N 的编号优先。
 # 每个账号还可以用 INSTABOX_MACHINE_2 / INSTABOX_LEASE_2 / INSTABOX_LEASE_TTL_2 / INSTABOX_AUTO_RESUME_2
 # 单独覆盖，不写就继承不带后缀的全局值（见 README《多个账号》）
-# TOKEN = "换成一串随机值，所有请求都要带 ?token=..."
+# 登录（面板）：ADMIN_PASSWORD / ADMIN_USER / SESSION_SECRET / TOKEN 全是 Secret，
+# 用 `npx wrangler secret put ADMIN_PASSWORD` 存，别写进本文件：
+#   ADMIN_PASSWORD  面板登录密码；设了它就必须登录（ADMIN_USER 默认 admin）
+#   ADMIN_USER      登录用户名（可选，默认 admin）
+#   SESSION_SECRET  会话签名密钥（可选，建议 openssl rand -hex 32；不设就从密码派生）
+#   TOKEN           脚本/curl 的访问令牌；只配它时也能当面板密码用，老部署不用改
+# 一个都不配 = 面板只读（能看，写操作 403）；确实要公开写再设 ALLOW_PUBLIC=1。
+# 面板右上角「账号」可以改用户名/密码，存 KV CONFIG 的 auth 键（PBKDF2-SHA256 + 随机盐）。
+# 改过之后 ADMIN_PASSWORD 就不生效了；想退回环境变量就删掉 KV 里的 auth 键。
+# AUTH_ITER 可调 PBKDF2 迭代次数（默认 50000，付费版可以调高）。
 
-# 想看 /log 就绑一个 KV（dashboard: Storage & Databases → KV → 建一个 → 变量名填 LOG）
+# KV 绑定（可选，两个都能用同一个 namespace，也可以各建一个）：
+#   LOG     保活日志，/log 和面板的「最近日志」用它
+#   CONFIG  面板的开关（每台机器保不保活、账号开关、全局暂停）+ 最近一次续租时间
+# 建法：dashboard → Storage & Databases → KV → Create namespace → 复制 id 填到下面
+# 都不绑也能跑，只是 /log 空、面板变成只读（能看能手动续租，开关存不下来）
 # [[kv_namespaces]]
 # binding = "LOG"
 # id = "<你的 KV namespace id>"
+#
+# [[kv_namespaces]]
+# binding = "CONFIG"
+# id = "<你的 KV namespace id>"
+
+[[kv_namespaces]]
+binding = "LOG"
+id = "90282b79e564413193dd3cb43f81f234"
+
+[[kv_namespaces]]
+binding = "CONFIG"
+id = "90282b79e564413193dd3cb43f81f234"

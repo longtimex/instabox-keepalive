@@ -1,0 +1,63 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Worker 测试
+        run: node worker/test.mjs
+
+      - name: Shell 测试
+        run: sh test/shell.test.sh
+
+      - name: 构建产物是否与源码同步
+        run: |
+          node worker/build.mjs
+          git diff --exit-code -- worker/dist/worker.js \
+            || (echo "::error::worker/dist/worker.js 过期了，本地跑 node worker/build.mjs 后提交" && exit 1)
+
+      - name: dist 必须被 Git 跟踪
+        run: |
+          git ls-files --error-unmatch worker/dist/worker.js \
+            || (echo "::error::worker/dist/worker.js 没进版本库，网页面板就没法粘贴部署" && exit 1)
+
+      - name: 关键文件没被 .gitignore 误伤
+        run: |
+          bad=0
+          for f in worker/ui.js worker/build.mjs worker/test.mjs worker/package.json \
+                   worker/dist/worker.js docs/panel.png docs/login.png \
+                   test/shell.test.sh test/fake-api.mjs .github/workflows/ci.yml; do
+            if git check-ignore -q "$f"; then
+              echo "::error::$f 被 .gitignore 忽略了"
+              bad=1
+            fi
+          done
+          exit $bad
+
+      - name: shellcheck（只提示，不阻断）
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y shellcheck
+          shellcheck -s sh keepalive.sh
+
+  # BusyBox ash、没有 bash 的环境 —— VPS 上最常见的就是这种
+  alpine:
+    runs-on: ubuntu-latest
+    container: alpine:3.20
+    steps:
+      - name: 装依赖（Alpine 镜像里没有 git/node/curl）
+        run: apk add --no-cache git nodejs curl
+      - uses: actions/checkout@v4
+      - name: Shell 测试（BusyBox ash）
+        run: sh test/shell.test.sh

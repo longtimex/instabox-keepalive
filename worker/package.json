@@ -1,0 +1,11 @@
+{
+  "name": "instabox-keepalive-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node test.mjs",
+    "dev": "node build.mjs && npx wrangler dev dist/worker.js",
+    "deploy": "npx wrangler deploy"
+  }
+}

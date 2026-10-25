@@ -544,6 +544,7 @@ each_machine() { # each_machine <fn> —— 对选中的机器逐台执行
 # KEY 第 1 把 = 主 key（空 KEY 报错在 preflight），后面每把都当独立账号跑一轮
 each_key() { # each_key <fn> —— 对每把 key 执行一轮（fn 全局变量 kfn，避免与 each_machine 的 fn 踩踏）
 	kfn=$1
+<<<<<<< HEAD
 	all_keys=$KEY
 	# 复用同一个 mktemp 文件：watch 模式下每轮都建新文件会堆一堆
 	if [ -z "$TMP_KEYS" ]; then
@@ -553,6 +554,16 @@ each_key() { # each_key <fn> —— 对每把 key 执行一轮（fn 全局变量
 	printf '%s\n' "$all_keys" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' |
 		grep -v '^$' | awk '!seen[$0]++' >"$TMP_KEYS"
 	total=$(wc -l <"$TMP_KEYS" | tr -d ' ')
+=======
+	# 没给 key 的时候直接报错退出：以前这里会静默跑完 0 个账号、退码 0，
+	# 定时任务看着"成功"，其实一次都没续
+	[ -n "$(printf '%s' "$KEY" | tr -d ' 	\n')" ] || die "未设置 INSTABOX_API_KEY（或 key=…）"
+	printf '%s\n' "$KEY" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' > "${TMPDIR:-/tmp}/ibk-keys.$$"
+	# 去重保序
+	awk '!seen[$0]++' "${TMPDIR:-/tmp}/ibk-keys.$$" > "${TMPDIR:-/tmp}/ibk-keys.$$.uniq"
+	mv "${TMPDIR:-/tmp}/ibk-keys.$$.uniq" "${TMPDIR:-/tmp}/ibk-keys.$$"
+	total=$(wc -l < "${TMPDIR:-/tmp}/ibk-keys.$$" | tr -d ' ')
+>>>>>>> fb42bf6d2d233f462e1eb165b02acfe434834f81
 	n=0
 	bad=0
 	while IFS= read -r k; do

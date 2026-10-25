@@ -1,11 +1,18 @@
 # instabox-keepalive
 
+<<<<<<< HEAD
 [InstaBox](https://instabox.sh) 的机器空闲 30 分钟就会自动休眠（`auto-suspend`）。本仓库一个 `keepalive.sh` 搞定保活：用官方 **activity lease** 定期续租，让机器一直醒着；另有 **Cloudflare Worker** 版，不想自己找台常开机器时用。两种跑法都支持多账号（多把 key 无限叠加）和 409 自愈（被挂起自动唤醒再续租）。Worker 版还带一个**网页管理面板**（登录后进 `/ui`）：逐台开关保活、看租约到期倒计时、手动续租/唤醒/释放、翻最近日志（可一键清空），全程点鼠标。
+=======
+[InstaBox](https://instabox.sh) 的机器空闲 30 分钟就会自动休眠（`auto-suspend`）。本仓库一个 `keepalive.sh` 搞定保活：用官方 **activity lease** 定期续租，让机器一直醒着；另有 **Cloudflare Worker** 版，不想自己找台常开机器时用；**Docker** 版给 NAS / 群晖 / 1Panel 这类容器环境。三种跑法都支持多账号（多把 key 无限叠加）和 409 自愈（被挂起自动唤醒再续租）。
+>>>>>>> fb42bf6d2d233f462e1eb165b02acfe434834f81
 
 > **为什么不能直接把休眠关掉**（`autoSuspendAfterSeconds=0`）？2026-10-18 实测：普通/邀请制账号的 `/v1/me` 里有 `"fixedAutoSuspendSeconds": 1800`、`"manualLifecycle": false`，服务端把空闲挂起阈值**锁死在账号级**，因此对 `PATCH /v1/machines/{id}` 传 `autoSuspendAfterSeconds: 0`（或任何值，含官方 `instabox auto-suspend <box> 0` 与 SDK `setAutoSuspend`）**一律被静默忽略**：返回 200，值仍是 1800。所以只能用租约这条官方口子。
 
+> 想用官方 `instabox` CLI 手动建机 / 进机 / 快照 / 开端口——见 [docs/CLI.md](docs/CLI.md)（CLI 操作手册）。
+
 > 为什么不在机器里面跑保活：机器一 suspend，里面的 cron/systemd 定时器全都冻住，谁也叫不醒自己。续租必须来自**外部**、靠那次出网请求带出去 —— 这也是 Worker 版要放到 Cloudflare 的原因；`keepalive.sh` 装在你自己的常开机器上，同样满足。
 
+<<<<<<< HEAD
 ## 先拿到 API key
 
 保活的每一条请求都要 `ibk_...` 开头的 API key。拿 key 的路径（[官方文档](https://instabox.sh/docs/keys-sdk)）：
@@ -29,6 +36,25 @@ npx wrangler secret put INSTABOX_API_KEY
 ```
 
 > 权限提醒：带 `machines:write` 的 key 能在机器里执行代码、还能选用 org Secrets。只保活的话别给它 `machines:delete`，也别用 Full access。免费额度、机器上限在控制台的 Account 页看（接口是 `GET /v1/usage`）。
+=======
+## 获取账号的 API key
+
+三种跑法都得先有一把 InstaBox 账号的 API key（形如 `ibk_...`）——下面命令里的 `ibk_xxx` 都指它。key 不是脚本生成的，要在 InstaBox 网页控制台里创建，入口藏得有点深：
+
+1. 打开 [instabox.sh](https://instabox.sh)，用 GitHub 或 Google 登录进控制台
+2. 点右上角**账号菜单 → Profile → API keys**
+3. 点 **Create Key**，权限二选一：
+   - **Full access** —— 全权限，省事
+   - **Restricted** —— 自己勾 scope；**只做保活用 `machines:write` 就够**（write 含 read；`machines:delete`、`images:*` 都不需要）
+4. 建完**立刻复制**：key 只在创建时显示一次，弹窗关了网页上再也看不到，丢了只能删掉重建
+
+几个容易踩的点：
+
+- key 长这样 `ibk_...`；GitHub/Google 登录只用来进控制台和建 key，**不能拿登录态当 key 用**
+- 一把 key 对应一个账号。多个账号就建多把，安装时逗号连起来：`key=ibk_aaa,ibk_bbb`
+- key 泄露或要换：到同一个 **API keys** 页面 revoke 旧的、建新的，然后改本机 `.env`（见下文）
+- 官方文档：<https://instabox.sh/docs/keys-sdk>
+>>>>>>> fb42bf6d2d233f462e1eb165b02acfe434834f81
 
 ## VPS 版 keepalive.sh：一键安装
 
@@ -86,7 +112,9 @@ sh /root/instabox-keepalive/keepalive.sh uninstall   # 彻底卸载（停服务�
 
 **密钥安全**：key 只落本机 `<安装目录>/.env`（0600，不进进程列表）；安装时 key 会出现在命令行一次，装完记得 `history -c`；建议只用 `machines:write` 权限的 key。
 
-## 多个账号（两种跑法通用）
+## 多个账号（三种跑法通用）
+
+每个账号要一把**各自独立**的 key——都在同一个 **Profile → API keys** 页面里分别 Create Key（换台账号就先用那个账号登录一次网页建 key，见上文《获取账号的 API key》）。
 
 `keepalive.sh` 和 Worker 都支持多账号：**第 N 个账号的变量名 = 单账号变量名 + `_N` 后缀**（脚本里也可以直接 `key=ibk_aaa,ibk_bbb`）。
 
@@ -141,6 +169,23 @@ INSTABOX_API_KEY_2 = ibk_xxx      # 占死 2 号位；任务变成 1=aaa 2=xxx 3
 ```
 
 反过来，如果几个账号都只想保活同名的那台机器（比如都叫 `qqq`）：Worker 只写 `INSTABOX_MACHINE=qqq`，脚本写 `machine=qqq`，所有账号都会继承这个筛选。
+
+## Docker 部署（NAS / 群晖 / 1Panel）
+
+宿主机不想装东西就丢进容器：镜像里装的就是这个仓库的 `keepalive.sh`。
+
+```sh
+cd docker
+cp .env.example .env && chmod 600 .env   # 填 INSTABOX_API_KEY=ibk_xxx
+docker compose up -d --build
+docker compose logs -f
+```
+
+变量名、多账号写法和 VPS 版完全一致，一份 `.env` 两边通用；`--status` / `--once` / `--release` 也能当一次性命令跑：
+
+```sh
+docker compose run --rm instabox-keepalive --status
+```
 
 ## Cloudflare Worker 部署（附加方案）
 
@@ -454,10 +499,17 @@ mkdir -p ../pages-dist && cp dist/worker.js ../pages-dist/_worker.js
 
 Pages 项目同样在 `Settings → Variables and secrets` 配 `INSTABOX_API_KEY` / `TOKEN`，在 `Settings → Functions → KV namespace bindings` 绑 `LOG` / `CONFIG`。cron 触发器是 Workers 的功能，Pages 里没有 —— 用 Pages 时要么加一个外部定时器打 `https://<项目>.pages.dev/?token=xxx`，要么干脆用 Workers（推荐，cron 免费且不用管）。
 
+## 致谢
+
+| 项目 | 在本项目里干什么活 |
+| --- | --- |
+| [InstaBox](https://instabox.sh) | 提供机器与官方 `activity lease` 接口，[文档](https://instabox.sh/docs/keys-sdk)里写清了 key 与租约用法 |
+| [jyucoeng/instabox-keepalive](https://github.com/jyucoeng/instabox-keepalive) | 早期 Worker 版的多账号实现，本项目在其基础上合并了 VPS 版与 409 自愈 |
+
 ## 免责声明
 
 仅用于管理你自己账号下的 InstaBox 机器。请自行确认每把 key 的权限范围与所在机器的可信程度 —— Worker 能读到这些 key，能读到它们的人也能操作你的机器。使用本项目产生的一切后果由使用者自行承担。
 
 ## License
 
-MIT © 2026 pingmike2
+[MIT](./LICENSE) © 2026 [pingmike2](https://github.com/pingmike2)

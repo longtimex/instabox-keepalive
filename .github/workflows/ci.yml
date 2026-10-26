@@ -1,24 +1,95 @@
 name: ci
 
+# 一套工作流覆盖全部回归：
+#   unit        node 跑的 Worker 单测（46 项，进程内假 KV + 假 API）
+#   shell       keepalive.sh 的 shell 回归（26 项，node 假 API）
+#   alpine      同上，但在 BusyBox ash 里跑（VPS 上最常见的就是这种）
+#   integration tools/run_tests.sh（python 假 API，shell + worker 端到端）
+#   dist        构建产物是否与源码同步、是否被 Git 跟踪、是否被 .gitignore 误伤
+#
+# 注意：这里只做「拦」，不做「自动修」。测试失败就是红的，等人工处理；
+# 早期版本会在 main 上自动 git revert 触发失败的提交，一次 flaky 就会回退正常
+# 代码，而且对 merge commit 直接 revert 会失败，已经去掉。
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test:
+  unit:
+    name: Worker 单测
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-
-      - name: Worker 测试
+      - name: node worker/test.mjs
         run: node worker/test.mjs
 
-      - name: Shell 测试
+  shell:
+    name: shell 回归（bash）
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: sh test/shell.test.sh
         run: sh test/shell.test.sh
+
+  # BusyBox ash、没有 bash 的环境 —— VPS 上最常见的就是这种
+  alpine:
+    name: shell 回归（busybox）
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container: alpine:3.22
+    steps:
+      - name: 装依赖（Alpine 镜像里没有 git/node/curl）
+        run: apk add --no-cache git nodejs curl
+      - uses: actions/checkout@v4
+      - name: sh test/shell.test.sh
+        run: sh test/shell.test.sh
+
+  integration:
+    name: 端到端（${{ matrix.label }}）
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: ubuntu
+            container: ""
+          - label: alpine-3.22
+            container: alpine:3.22
+    container: ${{ matrix.container }}
+    steps:
+      - name: 装依赖（alpine 容器）
+        if: matrix.container != ''
+        run: apk add --no-cache curl python3 nodejs
+      - uses: actions/checkout@v4
+      - name: sh tools/run_tests.sh all
+        run: sh tools/run_tests.sh all
+
+  dist:
+    name: 构建产物与仓库卫生
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
 
       - name: 构建产物是否与源码同步
         run: |
@@ -36,7 +107,9 @@ jobs:
           bad=0
           for f in worker/ui.js worker/build.mjs worker/test.mjs worker/package.json \
                    worker/dist/worker.js docs/panel.png docs/login.png \
-                   test/shell.test.sh test/fake-api.mjs .github/workflows/ci.yml; do
+                   test/shell.test.sh test/fake-api.mjs \
+                   tools/run_tests.sh tools/mock_api.py tools/worker_harness.mjs \
+                   .github/workflows/ci.yml; do
             if git check-ignore -q "$f"; then
               echo "::error::$f 被 .gitignore 忽略了"
               bad=1
@@ -50,14 +123,3 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y shellcheck
           shellcheck -s sh keepalive.sh
-
-  # BusyBox ash、没有 bash 的环境 —— VPS 上最常见的就是这种
-  alpine:
-    runs-on: ubuntu-latest
-    container: alpine:3.20
-    steps:
-      - name: 装依赖（Alpine 镜像里没有 git/node/curl）
-        run: apk add --no-cache git nodejs curl
-      - uses: actions/checkout@v4
-      - name: Shell 测试（BusyBox ash）
-        run: sh test/shell.test.sh

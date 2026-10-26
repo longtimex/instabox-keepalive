@@ -42,7 +42,19 @@ sh tools/run_tests.sh worker   # 只测 worker.js
 
 ## CI
 
-`.github/workflows/test.yml`：`keepalive.sh` / `worker/**` / `tools/**` 有改动即触发（push 到 main 或 PR），矩阵跑 ubuntu（dash/bash）+ **alpine:3.22（busybox）** 两套，全程假 key + 本地假 API。main 上测试挂了，CI 自动 `git revert` 肇事提交并推回 main（机器人 push 的 revert 不再触发本工作流，无循环）。
+`.github/workflows/ci.yml` 是唯一的 CI 入口，push / PR / 手动都会跑：
+
+| job | 跑什么 |
+| --- | --- |
+| `unit` | `node worker/test.mjs`（46 项，进程内假 KV + 假 API） |
+| `shell` | `sh test/shell.test.sh`（26 项，node 假 API） |
+| `alpine` | 同上，在 `alpine:3.22` 的 BusyBox ash 里跑（VPS 上最常见的就是这种） |
+| `integration` | `sh tools/run_tests.sh all`（python 假 API，shell + worker 端到端），ubuntu + alpine 矩阵 |
+| `dist` | `worker/dist/worker.js` 与源码同步、被 Git 跟踪、关键文件没被 `.gitignore` 误伤；外加 shellcheck（只提示不阻断） |
+
+全程假 key + 本地假 API，不碰真账号。
+
+CI 只负责「拦」，不自动修：main 上红了就人工处理。**不要**再加自动 `git revert` 的步骤——一次 flaky 就会把正常提交回退掉，而且对 merge commit 直接 `revert` 会失败（缺 `-m`），还会二次触发 CI。
 
 ## 发版
 

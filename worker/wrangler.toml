@@ -51,6 +51,10 @@ ALERT_MIN_INTERVAL = "1800"
 #   CONFIG  面板的开关（每台机器保不保活、账号开关、全局暂停）+ 最近一次续租时间
 # 建法：dashboard → Storage & Databases → KV → Create namespace → 复制 id 填到下面
 # 都不绑也能跑，只是 /log 空、面板变成只读（能看能手动续租，开关存不下来）
+#
+# 注意：这里故意保持注释状态。写死别人的 namespace id 会让 `wrangler deploy`
+# 直接失败（namespace 不属于你的账号），网页面板部署则完全不需要这一段。
+# 要用 CLI 部署 + 日志/面板配置，就把下面两段取消注释、换成你自己的 id。
 # [[kv_namespaces]]
 # binding = "LOG"
 # id = "<你的 KV namespace id>"
@@ -58,11 +62,3 @@ ALERT_MIN_INTERVAL = "1800"
 # [[kv_namespaces]]
 # binding = "CONFIG"
 # id = "<你的 KV namespace id>"
-
-[[kv_namespaces]]
-binding = "LOG"
-id = "90282b79e564413193dd3cb43f81f234"
-
-[[kv_namespaces]]
-binding = "CONFIG"
-id = "90282b79e564413193dd3cb43f81f234"

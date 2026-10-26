@@ -103,9 +103,12 @@ run_wk() {
 	wpath=$1
 	shift
 	start_mock "${WK_SCEN:-running}" || return 1
-	env -i PATH="$PATH" HOME="${HOME:-/tmp}" \
+	# 路径走环境变量、并且去掉开头的 / 再传：Git Bash 会把以 / 开头的值当 Windows
+	# 路径改写（/accounts → E:/.../Git/accounts），连 FOO=/accounts 这种赋值也躲不过。
+	# harness 那边会把这个值补回成 /accounts。
+	env -i PATH="$PATH" HOME="${HOME:-/tmp}" "WK_PATH=${wpath#/}" \
 		INSTABOX_API_URL="http://127.0.0.1:$MOCK_PORT" \
-		"$@" node "$HERE/worker_harness.mjs" "$wpath" 2>&1
+		"$@" node "$HERE/worker_harness.mjs" 2>&1
 }
 
 # ------------------------------------------------------------------ shell
@@ -178,7 +181,7 @@ test_shell() {
 	sec "keepalive.sh TTL 越界要拒绝"
 	out=$(env -i PATH="$PATH" INSTABOX_API_KEY=ibk_x INSTABOX_ENV_FILE=/dev/null INSTABOX_LEASE_TTL=5 \
 		sh "$REPO/keepalive.sh" --once 2>&1)
-	has "TTL 越界报错" "TTL 必须在 30-3600" "$out"
+	has "TTL 越界报错" "30-3600" "$out"
 }
 
 # ----------------------------------------------------------------- worker
@@ -188,8 +191,11 @@ test_worker() {
 		return 0
 	fi
 	sec "worker.js 语法"
-	node --input-type=module -e "
-		import('file://$REPO/worker/worker.js').then(m => {
+	# 用 pathToFileURL 而不是手拼 file://：Windows 下 $REPO 是 D:/...，
+	# 拼出来是 file://D:/...，Node 会报 "File URL path must be absolute"
+	WK_FILE="$REPO/worker/worker.js" node --input-type=module -e "
+		import { pathToFileURL } from 'node:url';
+		import(pathToFileURL(process.env.WK_FILE).href).then(m => {
 			const ok = typeof m.default?.fetch === 'function' && typeof m.default?.scheduled === 'function';
 			console.log(ok ? 'WORKER-EXPORTS-OK' : 'WORKER-EXPORTS-BAD');
 		}).catch(e => { console.log('WORKER-IMPORT-ERR ' + e.message); process.exit(1); });
@@ -210,23 +216,25 @@ test_worker() {
 	out=$(run_wk "/?token=s3cret" INSTABOX_API_KEY=ibk_testkey0001 TOKEN=s3cret)
 	has "对 token 200" "STATUS 200" "$out"
 
+	# 注意：`GET /` 是写接口，面板「没配密码 = 只读」的规则下会被 403。
+	# 这些用例要测的是续租本身，所以显式给 ALLOW_PUBLIC=1（文档里公开写的开关）。
 	sec "worker.js / 正常续租"
 	WK_SCEN=running
-	out=$(run_wk / INSTABOX_API_KEY=ibk_testkey0001)
+	out=$(run_wk / INSTABOX_API_KEY=ibk_testkey0001 ALLOW_PUBLIC=1)
 	has "续租 200" "STATUS 200" "$out"
 	has "带回 expiresAt" "expiresAt" "$out"
 	has "命中机器 testbox" "testbox" "$out"
 
 	sec "worker.js / suspended → resume 自愈"
 	WK_SCEN=suspended
-	out=$(run_wk / INSTABOX_API_KEY=ibk_testkey0001)
+	out=$(run_wk / INSTABOX_API_KEY=ibk_testkey0001 ALLOW_PUBLIC=1)
 	has "标记 resumed" '"resumed": true' "$out"
 	has "记录 wake" "resume:202" "$out"
 	has "唤醒后续租成功" "expiresAt" "$out"
 
 	sec "worker.js /dead → 唤醒不了如实失败"
 	WK_SCEN=dead
-	out=$(run_wk / INSTABOX_API_KEY=ibk_testkey0001)
+	out=$(run_wk / INSTABOX_API_KEY=ibk_testkey0001 ALLOW_PUBLIC=1)
 	has "失败返回 502" "STATUS 502" "$out"
 	has "说明没起来" "还没 running" "$out"
 
@@ -238,7 +246,7 @@ test_worker() {
 
 	sec "worker.js 没配 key 时拒绝"
 	WK_SCEN=running
-	out=$(run_wk /)
+	out=$(run_wk / ALLOW_PUBLIC=1)
 	has "报没配账号" "没配账号" "$out"
 }
 

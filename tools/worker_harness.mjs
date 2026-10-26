@@ -6,7 +6,9 @@
 import worker from "../worker/worker.js";
 
 const argv = process.argv.slice(2);
-const path = argv[0] || "/";
+// run_tests.sh 走 WK_PATH 传路径，而且故意去掉开头的 /（Git Bash 会把以 / 开头的值
+// 当 Windows 路径改写）。这里补回来；直接手跑时仍可 `node worker_harness.mjs /accounts`
+const path = process.env.WK_PATH !== undefined ? "/" + process.env.WK_PATH : argv[0] || "/";
 const BASE = "http://worker.local";
 
 function kvStub() {

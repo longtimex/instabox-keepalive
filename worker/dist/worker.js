@@ -776,12 +776,43 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
       });
   });
 
+  // 轮询节奏：有人操作时 20 秒一次，闲置时逐步退避到 60 秒。
+  // 租约倒计时是前端按 expiresAt 自己算的，拉取变慢不影响观感，但能把
+  // 「面板开着不动」时的列机器请求砍掉约 2/3。页面隐藏时完全不拉。
+  var POLL_MIN = 20000;
+  var POLL_MAX = 60000;
+  var pollGap = POLL_MIN;
+  var pollTimer = null;
+
+  function schedulePoll() {
+    clearTimeout(pollTimer);
+    pollTimer = setTimeout(function () {
+      if (document.hidden || loading) { schedulePoll(); return; }
+      var gap = pollGap;
+      load();
+      pollGap = Math.min(POLL_MAX, Math.round(gap * 1.5));
+      schedulePoll();
+    }, pollGap);
+  }
+
+  function pollNow() {
+    pollGap = POLL_MIN;
+    schedulePoll();
+  }
+
   (function boot() {
     load();
     setInterval(tickLeft, 1000);
-    setInterval(function () {
-      if (!document.hidden && !loading) load();
-    }, 20000);
+    schedulePoll();
+    // 切回来立刻刷一次，并回到最快节奏
+    document.addEventListener("visibilitychange", function () {
+      if (document.hidden) return;
+      load();
+      pollNow();
+    });
+    // 任何点击 / 按键都算「人在看」，重置退避
+    document.addEventListener("click", pollNow, true);
+    document.addEventListener("keydown", pollNow, true);
   })();
 })();
 </script>
@@ -1332,12 +1363,15 @@ async function recordLive(c, out) {
   try {
     // live 只是面板缓存：内容坏了就当空的覆盖掉，别让它卡住后续所有更新
     let prevList = [];
+    let prevRaw = "";
     try {
-      const prev = JSON.parse((await c.cfgKv.get(LIVE_KEY)) || "null");
+      prevRaw = (await c.cfgKv.get(LIVE_KEY)) || "";
+      const prev = JSON.parse(prevRaw || "null");
       if (prev && Array.isArray(prev.machines)) prevList = prev.machines;
     } catch {
       prevList = [];
-    }    // 本轮跑过的账号；跑全量时就是全部账号，仍然会顺手清掉已删除/已取消勾选的机器
+    }
+    // 本轮跑过的账号；跑全量时就是全部账号，仍然会顺手清掉已删除/已取消勾选的机器
     const touched = new Set((out.accounts || []).map((a) => a.account));
     const merged = prevList.filter((m) => {
       const ok = m && typeof m === "object" && typeof m.id === "string";
@@ -1358,6 +1392,23 @@ async function recordLive(c, out) {
       });
     }
     const payload = { at: out.at, paused: !!out.paused, machines: merged };
+    // 内容没变就不写：cron 每 9 分钟一轮，绑了 CONFIG 就是 168 次写/天，
+    // 而机器状态没变时（例如本轮全部失败、到期时间照旧）这次写只更新了 at。
+    // 真正续租成功一定会带来新的 expiresAt，所以不会漏更新。
+    if (prevRaw) {
+      try {
+        const old = JSON.parse(prevRaw);
+        if (
+          old &&
+          old.paused === payload.paused &&
+          JSON.stringify(old.machines || []) === JSON.stringify(merged)
+        ) {
+          return;
+        }
+      } catch {
+        // 旧值坏了就照常覆盖
+      }
+    }
     await c.cfgKv.put(LIVE_KEY, JSON.stringify(payload), { expirationTtl: 604800 });
   } catch (e) {
     console.log("instabox-keepalive: 写 live 失败", e.message);
@@ -1568,6 +1619,9 @@ async function stateOf(c, id) {
 
 // 挂了就先唤醒再续租：resume 优先，stopped 的用 start 兜底；running 后立刻续租一次。
 // 等待窗口可配（WAKE_TRIES × WAKE_GAP），默认 6×5s=30s —— 机器启动慢的时候别急着判失败。
+// 一次完整唤醒最坏要 WAKE_COST 个子请求：2 次 resume/start + 6 次轮询 + 2 次续租（含重试）。
+const WAKE_COST = 10;
+
 async function wakeThenLease(c, m) {
   const wake = [];
   for (const type of ["resume", "start"]) {
@@ -1576,6 +1630,11 @@ async function wakeThenLease(c, m) {
     if (a.ok) break;
   }
   for (let i = 0; i < c.wakeTries; i++) {
+    // 预算见底就停止轮询：机器已经醒了，把剩下的额度留给后面几台的续租，
+    // 下一轮 cron 会补上（机器醒着就不会再挂）
+    if (c.budget && c.budget.left < 2) {
+      return { ok: false, resumed: true, status: 0, error: "子请求预算用完，已唤醒但没等到 running（下一轮继续）", wake };
+    }
     await sleep(c.wakeGap * 1000);
     if ((await stateOf(c, m.id)) === "running") {
       const r = await lease(c, m.id);
@@ -1612,8 +1671,8 @@ async function keepaliveAccount(acc, conf) {
   const results = [];
   for (const m of targets) {
     const item = { machine: m.name, id: m.id };
-    // 唤醒一台最多要 10 个请求（2 次 resume/start + 6 次轮询 + 2 次续租），预算不够就收手
-    if (acc.budget && acc.budget.left < 4) {
+    // 续租本身 1-2 个请求（含一次重试）；连这个都不够就只能跳过
+    if (acc.budget && acc.budget.left < 2) {
       results.push({ ...item, ok: false, error: "子请求预算不够，本轮先跳过（下一轮继续）" });
       continue;
     }
@@ -1622,7 +1681,18 @@ async function keepaliveAccount(acc, conf) {
       if (r.ok) {
         results.push({ ...item, ok: true, expiresAt: r.json?.expiresAt });
       } else if (acc.autoResume && isNotRunning(r)) {
-        // 被挂起了：续租是空转，先把它弄醒再续
+        // 被挂起了：续租是空转，先把它弄醒再续。
+        // 但唤醒要花掉最多 WAKE_COST 个请求，预算不够就别开这个头 ——
+        // 否则会在轮询中途没额度，机器醒了却没续上租，下一轮又挂。
+        if (acc.budget && acc.budget.left < WAKE_COST) {
+          results.push({
+            ...item,
+            ok: false,
+            status: r.status,
+            error: `机器没在运行，但子请求预算不够唤醒（剩 ${acc.budget.left}，需要 ${WAKE_COST}），本轮跳过`,
+          });
+          continue;
+        }
         results.push({ ...item, ...(await wakeThenLease(acc, m)) });
       } else {
         results.push({ ...item, ok: false, status: r.status, error: r.text.slice(0, 200) });
@@ -1982,11 +2052,29 @@ const randomB64 = (n = 16) => b64url(crypto.getRandomValues(new Uint8Array(n)));
 // 读 KV 里的账号记录。返回 { record, error }：
 // - 没有这个键 → { record: null, error: "" }（正常退回环境变量）
 // - 读失败 / 结构不对 / 迭代次数越界 → { record: null, error: "..." }（调用方 fail-closed）
+//
+// 结果在 isolate 内缓存 60 秒：每个请求（面板每次轮询、每条 API 调用）都要读它，而它只在
+// 改密码时才变。KV 本身就有约 60 秒的跨地域传播延迟，这个缓存不引入新的不一致窗口。
+// 只缓存成功结果：读失败必须下次重试，不能把 fail-closed 缓存成常态。
 const ITER_MIN = 10000;
 const ITER_MAX = 200000;
+const AUTH_CACHE_MS = 60_000;
+const authCache = new WeakMap(); // KV 绑定对象 -> { at, value }
+
+function dropAuthCache(kv) {
+  if (kv) authCache.delete(kv);
+}
 
 async function loadAccount(kv) {
   if (!kv) return { record: null, error: "" };
+  const hit = authCache.get(kv);
+  if (hit && Date.now() - hit.at < AUTH_CACHE_MS) return hit.value;
+  const value = await readAccount(kv);
+  if (!value.error) authCache.set(kv, { at: Date.now(), value });
+  return value;
+}
+
+async function readAccount(kv) {
   let raw;
   try {
     raw = await kv.get(AUTH_KEY);
@@ -2120,6 +2208,8 @@ async function updateAccount(c, env, auth, body, request) {
   const hash = await pbkdf2(nextPass || current, salt, iter);
   const record = { v: 1, user: nextUser, algo: "pbkdf2-sha256", iter, salt, hash, at: new Date().toISOString() };
   await c.cfgKv.put(AUTH_KEY, JSON.stringify(record));
+  // 刚写完就作废缓存：本 isolate 后续请求必须立刻看到新凭据（旧密码当场失效）
+  dropAuthCache(c.cfgKv);
 
   // 凭据指纹变了 → 签名密钥跟着变 → 其它设备全部掉线；当前这台换一张新票继续用
   const fresh = await authConfig(env, c.cfgKv);

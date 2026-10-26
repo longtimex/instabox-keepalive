@@ -10,7 +10,9 @@ function fakeKV(opts = {}) {
   return {
     _map: map,
     failGet: opts.failGet || null, // (key) => true 时这次读抛错，用来模拟 KV 抖动
+    authReads: 0, // 只数 auth 这个键的读取次数（缓存测试用）
     async get(key) {
+      if (key === "auth") this.authReads += 1;
       if (this.failGet && this.failGet(key)) throw new Error("kv unavailable");
       return map.has(key) ? map.get(key) : null;
     },
@@ -783,6 +785,45 @@ let snapshot;
     "account=2 的续租不能清掉 1 号账号的到期时间",
   );
   ok("account 限定续租保留其它账号的 live 快照");
+}
+
+// 预算不够做完整唤醒时，别开这个头：以前会先花掉几个请求、机器醒了却没额度续租，
+// 结果「唤醒成功、保活失败」，下一轮又挂。现在直接跳过并在结果里说明原因。
+{
+  machineState.m_1 = "running";
+  machineState.m_2 = "suspended";
+  const before = calls.length;
+  // 预算 10：列机器 1 + m_1 续租 1 + m_2 续租 409 1 → 只剩 7，不够一次唤醒（10）
+  const tight = { ...env, INSTABOX_MACHINE: "", SUBREQUEST_LIMIT: "10", CONFIG: fakeKV(), LOG: fakeKV() };
+  const out = await (await worker.fetch(post("/api/renew", {}, auth), tight)).json();
+  const made = calls.slice(before);
+  assert.ok(
+    !made.some((c) => c.startsWith("POST /v1/machines/m_2/resume")),
+    "预算不够时不该发出唤醒请求",
+  );
+  const m2 = out.machines.find((m) => m.id === "m_2");
+  assert.equal(m2.ok, false);
+  assert.match(m2.error, /预算/, "结果里要说清是预算不够，而不是笼统失败");
+  ok("唤醒前先看子请求预算，不够就不开这个头");
+}
+
+// 账号记录（KV auth）在 isolate 内缓存 60 秒：每个请求都读一次太浪费，
+// 但改完密码必须立刻生效 —— 靠写后作废缓存保证。
+{
+  const kv = fakeKV();
+  const e = { ...env, CONFIG: kv, LOG: fakeKV(), TOKEN: "secret-token" };
+  await worker.fetch(req("/api/state", { headers: auth }), e);
+  assert.ok(kv.authReads > 0, "第一次请求应该读 KV 里的 auth");
+  kv.authReads = 0;
+  await worker.fetch(req("/api/state", { headers: auth }), e);
+  assert.equal(kv.authReads, 0, "第二次请求不该再读 KV 里的 auth");
+
+  const r = await worker.fetch(post("/api/account", { currentPassword: "secret-token", user: "admin", password: "newpass123" }, auth), e);
+  assert.equal(r.status, 200);
+  // 改完立刻用新密码登录：缓存必须已经被作废，否则旧记录还会命中 60 秒
+  const login = await worker.fetch(post("/api/login", { username: "admin", password: "newpass123" }, { "cf-connecting-ip": "9.9.9.9" }), e);
+  assert.equal(login.status, 200, "改密码后新凭据必须立刻可用");
+  ok("auth 记录 isolate 内缓存，改密码后立即失效");
 }
 
 console.log("\n" + passed + " 项通过");

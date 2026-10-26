@@ -726,12 +726,43 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
       });
   });
 
+  // 轮询节奏：有人操作时 20 秒一次，闲置时逐步退避到 60 秒。
+  // 租约倒计时是前端按 expiresAt 自己算的，拉取变慢不影响观感，但能把
+  // 「面板开着不动」时的列机器请求砍掉约 2/3。页面隐藏时完全不拉。
+  var POLL_MIN = 20000;
+  var POLL_MAX = 60000;
+  var pollGap = POLL_MIN;
+  var pollTimer = null;
+
+  function schedulePoll() {
+    clearTimeout(pollTimer);
+    pollTimer = setTimeout(function () {
+      if (document.hidden || loading) { schedulePoll(); return; }
+      var gap = pollGap;
+      load();
+      pollGap = Math.min(POLL_MAX, Math.round(gap * 1.5));
+      schedulePoll();
+    }, pollGap);
+  }
+
+  function pollNow() {
+    pollGap = POLL_MIN;
+    schedulePoll();
+  }
+
   (function boot() {
     load();
     setInterval(tickLeft, 1000);
-    setInterval(function () {
-      if (!document.hidden && !loading) load();
-    }, 20000);
+    schedulePoll();
+    // 切回来立刻刷一次，并回到最快节奏
+    document.addEventListener("visibilitychange", function () {
+      if (document.hidden) return;
+      load();
+      pollNow();
+    });
+    // 任何点击 / 按键都算「人在看」，重置退避
+    document.addEventListener("click", pollNow, true);
+    document.addEventListener("keydown", pollNow, true);
   })();
 })();
 </script>

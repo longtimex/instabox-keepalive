@@ -358,18 +358,25 @@ http() {
 # 租约接口只认机器 id（传名字会 400），所以名字要先换成 id；`all` 就是把这把 key
 # 能看到的机器全列出来。jq / python3 有就用，都没有就走 awk——按花括号深度扫，
 # 裸 BusyBox 也能跑。
+#
+# 三个解析器是逐级降级的关系，不是三选一：jq 装了但版本/表达式不兼容、python3 是
+# Windows 商店的空壳别名、API 改了结构 —— 任一情况都要往下试。否则上层会把
+# 「解析器挂了」误报成「这把 key 名下没有机器」，而且下一轮还是同样的空转。
 machines_list() { # -> 每行 "id<TAB>name"
 	if command -v jq >/dev/null 2>&1; then
-		printf '%s' "$HTTP_BODY" | jq -r '.machines[]? | "\(.id)\t\(.name)"'
-	elif command -v python3 >/dev/null 2>&1; then
-		printf '%s' "$HTTP_BODY" | python3 -c '
+		_ml=$(printf '%s' "$HTTP_BODY" | jq -r '.machines[]? | "\(.id)\t\(.name)"' 2>/dev/null)
+		if [ -n "$_ml" ]; then printf '%s\n' "$_ml"; return 0; fi
+	fi
+	if command -v python3 >/dev/null 2>&1; then
+		_ml=$(printf '%s' "$HTTP_BODY" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 for m in d.get("machines") or []:
-    print("%s\t%s" % (m.get("id", ""), m.get("name", "")))'
-	else
-		# 多行（pretty print）的 JSON 先压成一行：awk 是按行处理的，不压就只能解出单行响应
-		printf '%s' "$HTTP_BODY" | tr -d '\n\r' | awk '
+    print("%s\t%s" % (m.get("id", ""), m.get("name", "")))' 2>/dev/null)
+		if [ -n "$_ml" ]; then printf '%s\n' "$_ml"; return 0; fi
+	fi
+	# 兜底：多行（pretty print）的 JSON 先压成一行，awk 是按行处理的，不压就只能解出单行响应
+	printf '%s' "$HTTP_BODY" | tr -d '\n\r' | awk '
 			function getv(o, k,   s, r) {
 				# 冒号后带/不带空格都要吃："k":"v" 和 "k": "v"
 				s = index(o, "\"" k "\": \"")
@@ -413,7 +420,6 @@ for m in d.get("machines") or []:
 					}
 				}
 			}'
-	fi
 }
 
 resolve() {
@@ -518,8 +524,13 @@ each_machine() { # each_machine <fn> —— 对选中的机器逐台执行
 	list=$(machines_list) || { log "解析机器列表失败"; return 1; }
 	count=$(printf '%s\n' "$list" | grep -c . || true)
 	if [ "${count:-0}" -eq 0 ]; then
-		# 有 machines 字段却没解出机器 = 解析器（jq/python3/awk）没吃下这个 JSON，别误报成“没机器”
-		case "$HTTP_BODY" in
+		# 要区分两件事，否则会把正常情况报成故障：
+		#   {"machines":[]}      → 合法响应，这把 key 名下确实没有机器
+		#   {"machines":[{...}]} → 有数据但解析器（jq/python3/awk）没吃下，才需要提示装工具
+		# 判据用压缩空白后的形态，API 的 pretty JSON 也能对上。
+		compact=$(printf '%s' "$HTTP_BODY" | tr -d '[:space:]')
+		case "$compact" in
+			*'"machines":[]'*) log "这把 key 名下没有机器" ;;
 			*'"machines"'*) log "机器列表解析失败：响应里有 machines 但没解出来，装个 jq 或 python3 再跑" ;;
 			*) log "这把 key 名下没有机器" ;;
 		esac
@@ -544,7 +555,9 @@ each_machine() { # each_machine <fn> —— 对选中的机器逐台执行
 # KEY 第 1 把 = 主 key（空 KEY 报错在 preflight），后面每把都当独立账号跑一轮
 each_key() { # each_key <fn> —— 对每把 key 执行一轮（fn 全局变量 kfn，避免与 each_machine 的 fn 踩踏）
 	kfn=$1
-<<<<<<< HEAD
+	# 没给 key 的时候直接报错退出：以前这里会静默跑完 0 个账号、退码 0，
+	# 定时任务看着"成功"，其实一次都没续
+	[ -n "$(printf '%s' "$KEY" | tr -d ' 	\n')" ] || die "未设置 INSTABOX_API_KEY（或 key=…）"
 	all_keys=$KEY
 	# 复用同一个 mktemp 文件：watch 模式下每轮都建新文件会堆一堆
 	if [ -z "$TMP_KEYS" ]; then
@@ -554,16 +567,6 @@ each_key() { # each_key <fn> —— 对每把 key 执行一轮（fn 全局变量
 	printf '%s\n' "$all_keys" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' |
 		grep -v '^$' | awk '!seen[$0]++' >"$TMP_KEYS"
 	total=$(wc -l <"$TMP_KEYS" | tr -d ' ')
-=======
-	# 没给 key 的时候直接报错退出：以前这里会静默跑完 0 个账号、退码 0，
-	# 定时任务看着"成功"，其实一次都没续
-	[ -n "$(printf '%s' "$KEY" | tr -d ' 	\n')" ] || die "未设置 INSTABOX_API_KEY（或 key=…）"
-	printf '%s\n' "$KEY" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | grep -v '^$' > "${TMPDIR:-/tmp}/ibk-keys.$$"
-	# 去重保序
-	awk '!seen[$0]++' "${TMPDIR:-/tmp}/ibk-keys.$$" > "${TMPDIR:-/tmp}/ibk-keys.$$.uniq"
-	mv "${TMPDIR:-/tmp}/ibk-keys.$$.uniq" "${TMPDIR:-/tmp}/ibk-keys.$$"
-	total=$(wc -l < "${TMPDIR:-/tmp}/ibk-keys.$$" | tr -d ' ')
->>>>>>> fb42bf6d2d233f462e1eb165b02acfe434834f81
 	n=0
 	bad=0
 	while IFS= read -r k; do

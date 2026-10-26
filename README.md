@@ -1,10 +1,6 @@
 # instabox-keepalive
 
-<<<<<<< HEAD
-[InstaBox](https://instabox.sh) 的机器空闲 30 分钟就会自动休眠（`auto-suspend`）。本仓库一个 `keepalive.sh` 搞定保活：用官方 **activity lease** 定期续租，让机器一直醒着；另有 **Cloudflare Worker** 版，不想自己找台常开机器时用。两种跑法都支持多账号（多把 key 无限叠加）和 409 自愈（被挂起自动唤醒再续租）。Worker 版还带一个**网页管理面板**（登录后进 `/ui`）：逐台开关保活、看租约到期倒计时、手动续租/唤醒/释放、翻最近日志（可一键清空），全程点鼠标。
-=======
-[InstaBox](https://instabox.sh) 的机器空闲 30 分钟就会自动休眠（`auto-suspend`）。本仓库一个 `keepalive.sh` 搞定保活：用官方 **activity lease** 定期续租，让机器一直醒着；另有 **Cloudflare Worker** 版，不想自己找台常开机器时用；**Docker** 版给 NAS / 群晖 / 1Panel 这类容器环境。三种跑法都支持多账号（多把 key 无限叠加）和 409 自愈（被挂起自动唤醒再续租）。
->>>>>>> fb42bf6d2d233f462e1eb165b02acfe434834f81
+[InstaBox](https://instabox.sh) 的机器空闲 30 分钟就会自动休眠（`auto-suspend`）。本仓库一个 `keepalive.sh` 搞定保活：用官方 **activity lease** 定期续租，让机器一直醒着；另有 **Cloudflare Worker** 版，不想自己找台常开机器时用；**Docker** 版给 NAS / 群晖 / 1Panel 这类容器环境。三种跑法都支持多账号（多把 key 无限叠加）和 409 自愈（被挂起自动唤醒再续租）。Worker 版还带一个**网页管理面板**（登录后进 `/ui`）：逐台开关保活、看租约到期倒计时、手动续租/唤醒/释放、翻最近日志（可一键清空），全程点鼠标。
 
 > **为什么不能直接把休眠关掉**（`autoSuspendAfterSeconds=0`）？2026-10-18 实测：普通/邀请制账号的 `/v1/me` 里有 `"fixedAutoSuspendSeconds": 1800`、`"manualLifecycle": false`，服务端把空闲挂起阈值**锁死在账号级**，因此对 `PATCH /v1/machines/{id}` 传 `autoSuspendAfterSeconds: 0`（或任何值，含官方 `instabox auto-suspend <box> 0` 与 SDK `setAutoSuspend`）**一律被静默忽略**：返回 200，值仍是 1800。所以只能用租约这条官方口子。
 
@@ -12,31 +8,6 @@
 
 > 为什么不在机器里面跑保活：机器一 suspend，里面的 cron/systemd 定时器全都冻住，谁也叫不醒自己。续租必须来自**外部**、靠那次出网请求带出去 —— 这也是 Worker 版要放到 Cloudflare 的原因；`keepalive.sh` 装在你自己的常开机器上，同样满足。
 
-<<<<<<< HEAD
-## 先拿到 API key
-
-保活的每一条请求都要 `ibk_...` 开头的 API key。拿 key 的路径（[官方文档](https://instabox.sh/docs/keys-sdk)）：
-
-1. 浏览器打开 <https://instabox.sh>，用 GitHub / Google 登录（网页登录只是给人用的，脚本一律走 key）
-2. 右上角账户菜单 → **Profile → API keys** → **Create Key**
-3. 权限选 **Restricted**，勾 **`machines:write`** 就够保活用（写包含读：列机器、查状态、start/stop/pause/resume、改 auto-suspend、exec/SSH 都在里面）
-   - 选 **Full access** 也行，SDK 用户通常这么选；想最小权限就用上面的
-   - 如果还要**创建**机器，额外给 `images:read`（SDK/CLI 要按名字查模板），保活本身不需要
-4. **密钥只显示一次**，当场复制存好；关掉页面就再也看不到
-5. 同一页面可以 Revoke 撤销 —— 撤销会连带作废这把 key 签发的 SSH 证书
-
-拿到之后：
-
-```sh
-# VPS：直接喂给安装脚本
-key=ibk_xxx bash <(curl -Ls https://raw.githubusercontent.com/pingmike2/instabox-keepalive/main/keepalive.sh)
-
-# Worker：塞进 Secret
-npx wrangler secret put INSTABOX_API_KEY
-```
-
-> 权限提醒：带 `machines:write` 的 key 能在机器里执行代码、还能选用 org Secrets。只保活的话别给它 `machines:delete`，也别用 Full access。免费额度、机器上限在控制台的 Account 页看（接口是 `GET /v1/usage`）。
-=======
 ## 获取账号的 API key
 
 三种跑法都得先有一把 InstaBox 账号的 API key（形如 `ibk_...`）——下面命令里的 `ibk_xxx` 都指它。key 不是脚本生成的，要在 InstaBox 网页控制台里创建，入口藏得有点深：
@@ -54,7 +25,8 @@ npx wrangler secret put INSTABOX_API_KEY
 - 一把 key 对应一个账号。多个账号就建多把，安装时逗号连起来：`key=ibk_aaa,ibk_bbb`
 - key 泄露或要换：到同一个 **API keys** 页面 revoke 旧的、建新的，然后改本机 `.env`（见下文）
 - 官方文档：<https://instabox.sh/docs/keys-sdk>
->>>>>>> fb42bf6d2d233f462e1eb165b02acfe434834f81
+
+> 权限提醒：带 `machines:write` 的 key 能在机器里执行代码、还能选用 org Secrets。只保活的话别给它 `machines:delete`，也别用 Full access。免费额度、机器上限在控制台的 Account 页看（接口是 `GET /v1/usage`）。
 
 ## VPS 版 keepalive.sh：一键安装
 
@@ -250,7 +222,7 @@ Worker 版自带面板，浏览器打开 `https://<你的worker>.workers.dev/ui`
 - **账号卡片**：key 打码、租约名、TTL、机器数，整账号开关 + 「全部保活 / 恢复默认」
 - **暂停保活**：一键停掉 cron 的全部续租（手动「全部续租」不受影响，方便临时操作）
 - **最近日志**：读 `LOG` 里的最近记录
-- 20 秒自动刷新；顶部会提示 `CONFIG` 没绑之类的降级状态
+- 自动刷新：有人操作时 20 秒一次，闲置后逐步退避到 60 秒，页面切到后台就完全停（倒计时是前端自己算的，不影响观感）；顶部会提示 `CONFIG` 没绑之类的降级状态
 
 面板只是**覆盖层**，最终生效的规则是：
 

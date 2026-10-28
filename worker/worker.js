@@ -317,8 +317,48 @@ function timeoutSignal(ms) {
   }
 }
 
-// 调 API。429 / 5xx / 网络抖动自动重试两次（PUT 租约和带 Idempotency-Key 的写操作都幂等，
-// 重试是安全的）；重试完还不行就把最后一次的结果返回，交给上层判失败。
+// 从错误体里取平台给的提示：code / retryable / retryAfterSeconds。
+// 官方文档：暂时性错误在 body 里带 retryable，需要等待的还带 retryAfterSeconds
+// （no_capacity 是 60 秒），同一个值也会放进 Retry-After 响应头。
+function errInfo(r) {
+  const e = r && r.json && r.json.error;
+  if (!e || typeof e !== "object") return { code: "", retryable: false, after: 0 };
+  const after = Number(e.retryAfterSeconds);
+  return {
+    code: String(e.code || ""),
+    retryable: e.retryable === true,
+    after: Number.isFinite(after) && after > 0 ? after : 0,
+  };
+}
+
+// 409 里有两个是「等一下就好的」，和 machine_not_running 不是一回事：
+//   operation_conflict —— 另一个操作正在跑（平台的自动 suspend、你手动 pause/stop、
+//                        上一轮的 resume 还没结束）
+//   machine_cooldown   —— 机器刚变更完，还在冷却
+// 以前只认 not_running，这两种既没重试也没唤醒，直接记一条失败 —— 这就是
+// 「有时候续租失败、下一轮又自己好了」的主要来源。
+const TRANSIENT_409 = new Set(["operation_conflict", "machine_cooldown"]);
+
+// 单次等待上限：cron 一次调用有时长上限，不能真按 60 秒睡过去。
+// 等不起就留给下一轮 —— 下一轮只有几分钟，比把这次拖死强。
+const MAX_BACKOFF_MS = 5000;
+
+function isTransient(r) {
+  if (r.status === 429 || r.status >= 500) return true;
+  if (r.status === 409) return TRANSIENT_409.has(errInfo(r).code);
+  return false;
+}
+
+// 优先按服务端给的 retryAfterSeconds 等，没给就退化成 400/800ms 递增
+function retryDelay(r, i) {
+  const info = errInfo(r);
+  if (info.after) return Math.min(info.after * 1000, MAX_BACKOFF_MS);
+  return 400 * (i + 1);
+}
+
+// 调 API。429 / 5xx / 网络抖动 / 暂时性 409 自动重试两次（PUT 租约和带
+// Idempotency-Key 的写操作都幂等，重试是安全的）；重试完还不行就把最后一次的
+// 结果返回，交给上层判失败。
 async function call(c, method, path, body, opts = {}) {
   const tries = opts.retries ?? 2;
   let last = { ok: false, status: 0, json: null, text: "" };
@@ -343,11 +383,9 @@ async function call(c, method, path, body, opts = {}) {
         json = text ? JSON.parse(text) : null;
       } catch {}
 
-      // 409 是业务状态（机器没运行），重试也没用，别浪费子请求
-      const transient = res.status === 429 || res.status >= 500;
       last = { ok: res.ok, status: res.status, json, text };
-      if (transient && i < tries) {
-        await sleep(400 * (i + 1));
+      if (isTransient(last) && i < tries) {
+        await sleep(retryDelay(last, i));
         continue;
       }
       return last;
@@ -657,9 +695,9 @@ const rnd = () => Math.random().toString(36).slice(2, 8);
 // 重试时复用同一个 key，让服务端能正确去重。重试次数和 call() 对齐（首次 + 2 次）。
 async function act(c, id, type) {
   const key = `ka-${type}-${id}-${Date.now()}-${rnd()}`;
-  let last = { ok: false, status: 0, text: "" };
+  let last = { ok: false, status: 0, json: null, text: "" };
   for (let i = 0; i <= 2; i++) {
-    if (!spend(c)) return { ok: false, status: 0, text: "子请求预算用完，跳过唤醒" };
+    if (!spend(c)) return { ok: false, status: 0, json: null, text: "子请求预算用完，跳过唤醒" };
     try {
       const res = await fetch(`${c.api}/v1/machines/${encodeURIComponent(id)}/${encodeURIComponent(type)}`, {
         method: "POST",
@@ -667,12 +705,17 @@ async function act(c, id, type) {
         signal: timeoutSignal(15000),
       });
       const text = await res.text();
-      last = { ok: res.ok, status: res.status, text };
-      if (!(res.status === 429 || res.status >= 500)) return last;
+      let json = null;
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch {}
+      last = { ok: res.ok, status: res.status, json, text };
+      // 换状态时撞上 operation_conflict 很常见（上一轮的 resume 还没跑完），同样要重试
+      if (!isTransient(last)) return last;
     } catch (e) {
-      last = { ok: false, status: 0, text: String(e.message || e) };
+      last = { ok: false, status: 0, json: null, text: String(e.message || e) };
     }
-    if (i < 2) await sleep(400 * (i + 1));
+    if (i < 2) await sleep(retryDelay(last, i));
   }
   return last;
 }

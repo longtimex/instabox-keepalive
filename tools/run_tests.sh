@@ -126,6 +126,15 @@ test_shell() {
 	has "续租成功" "续租 ok" "$out"
 	has "带回 expiresAt" "到期 20" "$out"
 
+	# 平台正在变状态（另一个操作在跑）回的是 409 operation_conflict，不是
+	# machine_not_running：应该等一下就重试，不该去唤醒，也不该记成失败。
+	sec "keepalive.sh --once（409 operation_conflict → 等一下重试）"
+	out=$(run_ka conflict --once)
+	log=$(reqlog)
+	has "第一次撞上 operation_conflict" "activity-leases/keepalive 409" "$log"
+	has "重试后成功" "续租 ok" "$out"
+	nhas "不该误判成挂起去唤醒" "/resume" "$log"
+
 	sec "keepalive.sh --once（suspended → resume 自愈）"
 	out=$(run_ka suspended --once)
 	log=$(reqlog)

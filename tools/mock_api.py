@@ -13,6 +13,7 @@ scenario:
   suspended  机器 suspended，PUT 租约回 409；POST /resume 后转 running
   stopped    机器 stopped，PUT 回 409；POST /resume 回 409，POST /start 后转 running
   dead       永远不 running，resume/start 都回 409（测放弃路径）
+  conflict   机器 running，但第一次 PUT 回 409 operation_conflict（测"等一下重试"）
   nolist     GET /v1/machines 返回空列表（测"这把 key 名下没有机器"）
   error      GET /v1/machines 返回 500（测报错路径）
 
@@ -28,6 +29,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 STATE_LOCK = threading.Lock()
 STATE = {}
 ARGS = None
+CONFLICT_LEFT = 1  # conflict 场景下，第一次 PUT 租约回 409 operation_conflict
 
 
 def now_iso():
@@ -116,10 +118,20 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"error": {"code": "not_found"}})
 
     def do_PUT(self):
+        global CONFLICT_LEFT
         path = self.path.split("?")[0]
         body = self._body()
         ttl = int(body.get("ttlSeconds") or ARGS.ttl)
         if "/activity-leases/" in path:
+            # 平台正在变状态：另一个操作在跑。这是暂时的，脚本应该等一下就重试，
+            # 而不是当成「机器没运行」去唤醒、也不是直接记一条失败。
+            if ARGS.scenario == "conflict" and CONFLICT_LEFT > 0:
+                CONFLICT_LEFT -= 1
+                note(f"PUT {path} 409 operation_conflict")
+                return self._send(
+                    409,
+                    {"error": {"code": "operation_conflict", "retryable": True, "retryAfterSeconds": 1}},
+                )
             if current_state() != "running":
                 note(f"PUT {path} 409")
                 return self._send(
@@ -173,7 +185,7 @@ def main():
     p.add_argument("--port", type=int, default=8897)
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--scenario", default="running",
-                   choices=["running", "suspended", "stopped", "dead", "nolist", "error"])
+                   choices=["running", "suspended", "stopped", "dead", "conflict", "nolist", "error"])
     p.add_argument("--machine-id", default="m_test")
     p.add_argument("--machine-name", default="testbox")
     p.add_argument("--ttl", type=int, default=900)

@@ -334,25 +334,46 @@ ensure_cfg() {
 	CFG_KEY=$KEY
 }
 
+# 平台把「另一个操作正在跑」也回 409（operation_conflict / machine_cooldown），
+# 这是暂时的、等一两秒再试就好；machine_not_running 才是需要唤醒的那种。
+# 以前只认 not_running，这两种会直接被记成续租失败 —— 这是「偶发失败」的常见来源。
+is_transient_409() {
+	[ "$HTTP_CODE" = "409" ] || return 1
+	printf '%s' "$HTTP_BODY" | grep -Eqi 'operation_conflict|machine_cooldown'
+}
+
 # http <METHOD> <PATH> [JSON_BODY] -> HTTP_CODE + HTTP_BODY
 # curl 自带重试：超时 / 连接失败 / 408 / 429 / 5xx 会再试两次（续租是幂等的，重试安全）。
+# 暂时性 409 由外层再补两次，间隔 2s / 4s —— curl 不认识这个错误码。
 # -m 30 是整个操作的上限（含重试），不会把一轮拖太久。
 http() {
 	method=$1
 	path=$2
 	data=${3:-}
 	ensure_cfg
-	if [ -n "$data" ]; then
-		resp=$(curl -sS -m 30 --retry 2 --retry-delay 1 --retry-connrefused -X "$method" "$API$path" \
-			-K "$TMP_CFG" -H 'Content-Type: application/json' \
-			-d "$data" -w '\n%{http_code}' 2>&1) || { HTTP_CODE=0; HTTP_BODY=$resp; return 1; }
-	else
-		resp=$(curl -sS -m 30 --retry 2 --retry-delay 1 --retry-connrefused -X "$method" "$API$path" \
-			-K "$TMP_CFG" -w '\n%{http_code}' 2>&1) || { HTTP_CODE=0; HTTP_BODY=$resp; return 1; }
-	fi
-	HTTP_CODE=$(printf '%s' "$resp" | tail -n 1)
-	HTTP_BODY=$(printf '%s' "$resp" | sed '$d')
-	[ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "204" ]
+	tries=0
+	while :; do
+		if [ -n "$data" ]; then
+			resp=$(curl -sS -m 30 --retry 2 --retry-delay 1 --retry-connrefused -X "$method" "$API$path" \
+				-K "$TMP_CFG" -H 'Content-Type: application/json' \
+				-d "$data" -w '\n%{http_code}' 2>&1) || { HTTP_CODE=0; HTTP_BODY=$resp; return 1; }
+		else
+			resp=$(curl -sS -m 30 --retry 2 --retry-delay 1 --retry-connrefused -X "$method" "$API$path" \
+				-K "$TMP_CFG" -w '\n%{http_code}' 2>&1) || { HTTP_CODE=0; HTTP_BODY=$resp; return 1; }
+		fi
+		HTTP_CODE=$(printf '%s' "$resp" | tail -n 1)
+		HTTP_BODY=$(printf '%s' "$resp" | sed '$d')
+		if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "204" ]; then
+			return 0
+		fi
+		tries=$((tries + 1))
+		if [ "$tries" -gt 2 ] || ! is_transient_409; then
+			return 1
+		fi
+		# 2s、4s：给平台把那个操作跑完的时间，又不至于把一轮拖长。
+		# 用 nap 而不是 sleep：--watch 收到 TERM 时能立刻退出，不用等这几秒。
+		nap $((tries * 2))
+	done
 }
 
 # 租约接口只认机器 id（传名字会 400），所以名字要先换成 id；`all` 就是把这把 key

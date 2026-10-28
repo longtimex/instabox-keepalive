@@ -38,6 +38,8 @@ const machinesByKey = () => ({
 let calls = [];
 let hooks = [];
 let leaseFailures = 0;
+let leaseConflicts = 0;
+let leaseRateLimits = 0;
 
 globalThis.fetch = async (input, init = {}) => {
   const url = new URL(String(input));
@@ -75,6 +77,22 @@ globalThis.fetch = async (input, init = {}) => {
       if (leaseFailures > 0) {
         leaseFailures--;
         return new Response(JSON.stringify({ error: "upstream" }), { status: 503 });
+      }
+      // 平台正在变状态：另一个操作在跑，不是机器没运行
+      if (leaseConflicts > 0) {
+        leaseConflicts--;
+        return new Response(
+          JSON.stringify({ error: { code: "operation_conflict", retryable: true, retryAfterSeconds: 0.02 } }),
+          { status: 409 },
+        );
+      }
+      // 限流：带 retryAfterSeconds，验证我们按服务端给的秒数等
+      if (leaseRateLimits > 0) {
+        leaseRateLimits--;
+        return new Response(
+          JSON.stringify({ error: { code: "rate_limited", retryable: true, retryAfterSeconds: 0.05 } }),
+          { status: 429, headers: { "Retry-After": "1" } },
+        );
       }
       if (machineState[m[1]] !== "running") {
         return new Response(JSON.stringify({ error: "machine_not_running" }), { status: 409 });
@@ -824,6 +842,36 @@ let snapshot;
   const login = await worker.fetch(post("/api/login", { username: "admin", password: "newpass123" }, { "cf-connecting-ip": "9.9.9.9" }), e);
   assert.equal(login.status, 200, "改密码后新凭据必须立刻可用");
   ok("auth 记录 isolate 内缓存，改密码后立即失效");
+}
+
+// 平台正在变状态时回 409 operation_conflict（另一个操作在跑），和 machine_not_running
+// 不是一回事。以前这种既没重试也没唤醒，直接记一条失败 —— 「偶发续租失败」的主要来源。
+{
+  const e = { ...env, INSTABOX_MACHINE: "m_1", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_1 = "running";
+  leaseConflicts = 1;
+  const before = calls.length;
+  const body = await (await worker.fetch(post("/api/renew", {}, auth), e)).json();
+  const puts = calls.slice(before).filter((c) => c.includes("activity-leases")).length;
+  assert.equal(body.ok, true, "operation_conflict 应该被重试掉，不该记成失败");
+  assert.equal(puts, 2, "第一次 409 + 第二次成功");
+  ok("409 operation_conflict 会重试，不再记成失败");
+}
+
+// 429 带 retryAfterSeconds：按服务端给的秒数等，而不是固定 400ms 硬撞
+{
+  const e = { ...env, INSTABOX_MACHINE: "m_1", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_1 = "running";
+  leaseRateLimits = 1;
+  const before = calls.length;
+  const t0 = Date.now();
+  const body = await (await worker.fetch(post("/api/renew", {}, auth), e)).json();
+  const ms = Date.now() - t0;
+  const puts = calls.slice(before).filter((c) => c.includes("activity-leases")).length;
+  assert.equal(body.ok, true);
+  assert.equal(puts, 2);
+  assert.ok(ms >= 40, "应该等过 retryAfterSeconds（50ms），而不是立刻重试");
+  ok("429 按 retryAfterSeconds 等待后再重试");
 }
 
 console.log("\n" + passed + " 项通过");

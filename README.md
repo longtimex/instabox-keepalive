@@ -161,7 +161,7 @@ docker compose run --rm instabox-keepalive --status
 
 ## Cloudflare Worker 部署（附加方案）
 
-没有常开的机器也不影响保活：把续租放到 Cloudflare Worker 上，cron 每 9 分钟自动跑一次，和你的任何机器无关。推荐网页面板部署（不用装 wrangler），想用命令行看最后面的《CLI 部署》。
+没有常开的机器也不影响保活：把续租放到 Cloudflare Worker 上，cron 每 5 分钟自动跑一次，和你的任何机器无关。推荐网页面板部署（不用装 wrangler），想用命令行看最后面的《CLI 部署》。
 
 ### 部署步骤
 
@@ -192,7 +192,7 @@ docker compose run --rm instabox-keepalive --status
 
    > **至少要设 `ADMIN_PASSWORD` 或 `TOKEN` 其中一个**：两个都不设，面板会变成**只读**（能看，但续租/改配置一律 403），登录页也会明确警告。
    > `INSTABOX_LEASE_TTL` 要比 cron 间隔大：间隔 9 分钟就填 `900`，填 `300` 会在两次续租之间出现空窗。
-4. `Settings` → `Triggers` → `Cron Triggers` → `Add Cron Trigger`，填 `*/9 * * * *`（每 9 分钟）→ 保存。这就是自动保活的开关
+4. `Settings` → `Triggers` → `Cron Triggers` → `Add Cron Trigger`，填 `*/5 * * * *`（每 5 分钟）→ 保存。这就是自动保活的开关
 5. 两个可选的 KV（`Storage & Databases` → `KV` → `Create namespace` → 回到 Worker 的 `Settings` → `Bindings` 加绑定）：
 
    | 绑定变量名 | 作用 | 不绑的后果 |
@@ -353,7 +353,8 @@ key=ibk_xxx bash <(curl -Ls https://raw.githubusercontent.com/pingmike2/instabox
 
 ### 3. 让单次请求更能扛
 
-- **自动重试**（已内置）：Worker 遇到 429 / 5xx / 网络错误重试 2 次；脚本的 curl 带 `--retry 2 --retry-connrefused`
+- **自动重试**（已内置）：Worker 遇到 429 / 5xx / 网络错误重试 2 次，并读服务端给的 `retryAfterSeconds`（单次最多等 5 秒，等不起就留给下一轮）；脚本的 curl 带 `--retry 2 --retry-connrefused`，暂时性 409 另外补两次 2s / 4s
+- **暂时性 409 不算失败**：平台在「另一个操作正在跑」（`operation_conflict`）或机器冷却（`machine_cooldown`）时也回 409，这跟 `machine_not_running` 是两回事 —— 前者重试就好，后者才需要唤醒。以前一律记失败，是「偶发失败」的主要来源
 - **唤醒窗口放宽**：从 15 秒加到 30 秒（`WAKE_TRIES=6 × WAKE_GAP=5`），机器启动慢不再被误判成「唤不醒」
 - **用机器 id 不用名字**：`INSTABOX_MACHINE=m_xxx` 少一次「按名字查 id」的请求，也少一个失败点
 - **幂等键带随机/序号**：同一秒内重试不会撞上旧 key（撞了会拿到缓存的旧响应，看着像成功了）
@@ -419,15 +420,15 @@ POST /api/log/clear            清空最近日志（只删 KV 里的历史记录
 
 多账号不会增加写次数：一条日志装的是所有账号的汇总，`hourly` 模式下仍然每小时最多 1 条，额度算法和单账号完全一样。KV 绑定名、namespace、`log` 这个 key 也都不用改。
 
-绑了 `CONFIG`（也就是用了面板）会多一笔：每轮 cron 写一次 `live` 快照（面板的「租约倒计时」靠它），`*/9` 就是 168 次/天，加上日志的 ~24 次约 192 次，仍只占免费额度的 19%。不绑 `CONFIG` 就没有这笔开销。
+绑了 `CONFIG`（也就是用了面板）会多一笔：每轮 cron 写一次 `live` 快照（面板的「租约倒计时」靠它），`*/5` 就是 288 次/天，加上日志的 ~24 次约 312 次，占免费额度的 31%（这是上界：机器状态没变的那一轮不会写）。不绑 `CONFIG` 就没有这笔开销。
 
 | cron 间隔 | 次数/天 | `every` 模式写/天 | `hourly` 模式写/天 |
 | --- | --- | --- | --- |
-| `*/9` | 168 | 168 | ~24 |
+| `*/5` | 288 | 288 | ~24 |
 | `*/4` | 360 | 360 | ~24 |
 | `* * * * *` | 1440 | **1440（超了）** | ~24 |
 
-也就是说：间隔 4 分钟以上用默认值随便跑；间隔 1 分钟的 `every` 会超额度，这时候要么留 `hourly`，要么把 `INSTABOX_LOG_MODE` 设成 `off` 完全不写。
+也就是说：间隔 2 分钟以上都还在额度内（`*/2` 约 744 次/天）；只有每分钟跑、并且用 `every` 模式才会超 —— 这时候要么留 `hourly`，要么把 `INSTABOX_LOG_MODE` 设成 `off` 完全不写。
 
 ## CLI 部署（可选，用 wrangler）
 
@@ -441,7 +442,7 @@ npx wrangler secret put TOKEN
 npx wrangler deploy
 ```
 
-`worker/wrangler.toml` 里已经设好 `crons = ["*/9 * * * *"]` 和 `INSTABOX_LEASE_TTL = "900"`，按需改就行。KV 绑定把文件末尾那两段 `[[kv_namespaces]]` 的注释去掉、填上 namespace id 再 `deploy`。
+`worker/wrangler.toml` 里已经设好 `crons = ["*/5 * * * *"]` 和 `INSTABOX_LEASE_TTL = "900"`，按需改就行。KV 绑定把文件末尾那两段 `[[kv_namespaces]]` 的注释去掉、填上 namespace id 再 `deploy`。
 
 本地开发与自测（都不需要装依赖）：
 

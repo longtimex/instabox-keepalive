@@ -6,10 +6,12 @@ compatibility_date = "2026-10-16"
 # 要粘到 Cloudflare 网页面板的单文件版本是构建产物 dist/worker.js：
 #   cd worker && npm run build        （等价于 node build.mjs）
 
-# 每 9 分钟续一次 15 分钟的租约（cron 最小粒度 1 分钟）
-# 注意 TTL 必须大于 cron 间隔，否则两次续租之间会空窗：间隔 9 分钟就填 900
+# 每 5 分钟续一次 15 分钟的租约（cron 最小粒度 1 分钟）
+# 余量 = TTL / 间隔 = 3 倍：能扛住 2 轮连续失败或 cron 延迟。
+# 别把间隔压到和 TTL 差不多（例如 */9 + 900 = 1.67 倍）—— Cloudflare 的 cron 不保证准点，
+# 一轮延迟加一轮失败，机器就睡了。
 [triggers]
-crons = ["*/9 * * * *"]
+crons = ["*/5 * * * *"]
 
 [vars]
 # 非密钥的配置；INSTABOX_API_KEY（以及多账号的 _2、_3 …）用 `npx wrangler secret put ...` 存

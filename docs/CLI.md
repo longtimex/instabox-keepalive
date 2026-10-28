@@ -253,7 +253,7 @@ export INSTABOX_NO_TELEMETRY=1       # 关闭遥测（或 DO_NOT_TRACK=1）
 CLI 用来**建和管理**机器；要机器**一直醒着**不被空闲挂起，用本仓库的方案：
 
 - **Keepalive 脚本**：`keepalive.sh` 装在任何常开机器/容器里，定期调用官方 **activity lease** 续租，配 `key=ibk_aaa,ibk_bbb` 可同时护多账号。
-- **Cloudflare Worker**：不想自己找常开机器时，把机器 key 作为 secret 存进 worker，cron 每 9 分钟自动续租。
+- **Cloudflare Worker**：不想自己找常开机器时，把机器 key 作为 secret 存进 worker，cron 每 5 分钟自动续租。
 - 保活只负责**续租**，不负责建机 —— 先用上面第 4 节把机器建出来，保活才能捧着。
 
 ---

@@ -5,7 +5,7 @@
 # 外部命令只用系统自带的基础工具：curl + awk/sed/grep/cut/tr（都不需要 jq、python）。
 #
 #   安装（key 只写进本机 0600 的 .env，绝不落仓库、不进进程列表）
-#     key=ibk_xxx bash <(curl -Ls https://raw.githubusercontent.com/pingmike2/instabox-keepalive/main/keepalive.sh)
+#     key=ibk_xxx bash <(curl -Ls https://raw.githubusercontent.com/longtimex/instabox-keepalive/main/keepalive.sh)
 #     machine=qqq 只保一台；machine= 留空 / all = 保活这把 key 名下全部机器
 #
 #   卸载
@@ -47,7 +47,7 @@ set -u
 # 脚本会写 .env / 临时文件：默认就把新建文件的权限收紧，别指望每个分支都记得 chmod
 umask 077
 
-RAW=${RAW_BASE:-https://raw.githubusercontent.com/pingmike2/instabox-keepalive/main}
+RAW=${RAW_BASE:-https://raw.githubusercontent.com/longtimex/instabox-keepalive/main}
 DEF_DIR=${INSTALL_DIR:-/root/instabox-keepalive}
 DIR=$DEF_DIR
 SERVICE=${SERVICE_NAME:-instabox-keepalive}

@@ -38,7 +38,7 @@ sh tools/run_tests.sh worker   # 只测 worker.js
 - 提交信息前缀：`feat:` / `fix:` / `docs:` / `refactor:` / `chore:`，正文说清**改了什么 + 为什么**，别写「优化代码」。
 - 行为有变化时，**同步更新 README 对应章节**（新增 env 变量必须进 README 的变量表；多账号规则写在《多个账号》一节）。
 - 改了用户可见行为，README 里示例命令要能**复制即跑**，不许留 `xxx` 省略号以外的假占位。
-- 提 PR 前自查敏感信息：`grep -rniE "ibk_|secret|token|api[_-]?key" . --exclude-dir=.git`，确认没有真实凭据。
+- 提 PR 前必须跑 `node tools/check_sensitive.mjs`。它会检查真实 key、Cloudflare account/KV ID、私人邮箱和常见密钥形态；测试用假 key（`ibk_testkey...`）与占位符在白名单内。CI 也会跑这道门禁。
 
 ## CI
 
@@ -46,11 +46,11 @@ sh tools/run_tests.sh worker   # 只测 worker.js
 
 | job | 跑什么 |
 | --- | --- |
-| `unit` | `node worker/test.mjs`（46 项，进程内假 KV + 假 API） |
+| `unit` | `node worker/test.mjs`（81 项，进程内假 KV + 假 API + 假 Telegram） |
 | `shell` | `sh test/shell.test.sh`（26 项，node 假 API） |
 | `alpine` | 同上，在 `alpine:3.22` 的 BusyBox ash 里跑（VPS 上最常见的就是这种） |
 | `integration` | `sh tools/run_tests.sh all`（python 假 API，shell + worker 端到端），ubuntu + alpine 矩阵 |
-| `dist` | `worker/dist/worker.js` 与源码同步、被 Git 跟踪、关键文件没被 `.gitignore` 误伤；外加 shellcheck（只提示不阻断） |
+| `dist` | `worker/dist/worker.js` 与源码同步、**能被真的 import 一次**（内联撞名只有 import 才会暴露）、被 Git 跟踪、关键文件没被 `.gitignore` 误伤；外加 shellcheck（只提示不阻断） |
 
 全程假 key + 本地假 API，不碰真账号。
 

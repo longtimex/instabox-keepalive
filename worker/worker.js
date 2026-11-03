@@ -28,6 +28,10 @@
 //   POST /api/renew           手动续租（不吃「暂停」，忽略 paused）
 //   POST /api/release         放掉租约
 //   POST /api/machine         { account, id, action: renew|resume|start|release }
+//   POST /tg/<secret>         Telegram 机器人 webhook（见 telegram.js）
+//   GET  /api/telegram        注册/查看 Telegram webhook：?action=set|menu|info
+//   POST /api/telegram        面板里配机器人：{ telegram: {token,secret,chats}, register }
+//                             telegram:null = 清掉 KV 里的覆盖、回退环境变量
 //
 // 都要带 ?token=...（设了 TOKEN 变量时），也可以改用 X-Token 请求头或
 // Authorization: Bearer ...（面板走请求头，token 不会进 URL/日志）。
@@ -45,6 +49,7 @@
 // 注意：本文件 import 了 ./ui.js（面板 HTML）。网页面板部署请粘贴构建产物
 // worker/dist/worker.js（已内联面板），CLI 部署直接用 wrangler（会自动打包）。
 import { UI_HTML, LOGIN_HTML } from "./ui.js";
+import { handleTelegram, telegramAdmin, tgConfig, tgView } from "./telegram.js";
 
 const API_DEFAULT = "https://api.instabox.sh";
 const LEASE_DEFAULT = "keepalive";
@@ -59,7 +64,17 @@ const LOG_KEEP = 48;
 
 // 会改变状态的接口。两条规矩：一律 POST（旧 /release 的 GET 只留给 token 认证），
 // 以及没配密码时默认拒绝（除非 ALLOW_PUBLIC=1）。
-const WRITE_ROUTES = new Set(["/", "/release", "/api/renew", "/api/release", "/api/config", "/api/machine", "/api/account", "/api/log/clear"]);
+const WRITE_ROUTES = new Set([
+  "/",
+  "/release",
+  "/api/renew",
+  "/api/release",
+  "/api/config",
+  "/api/machine",
+  "/api/account",
+  "/api/log/clear",
+  "/api/telegram",
+]);
 
 function clampTtl(value, fallback) {
   const n = Number.parseInt(value ?? "", 10);
@@ -103,7 +118,8 @@ function cfg(env) {
     // 预算对象所有账号共享，call/act 每发一个请求扣一格
     budget: { left: clampInt(env.SUBREQUEST_LIMIT, 45, 10, 900) },
   };
-  return { ...base, accounts: accountsOf(env, base) };
+  // env 留着：Telegram 那几个变量不走 cfg（面板里也能填），要用的时候现取
+  return { ...base, env, accounts: accountsOf(env, base) };
 }
 
 // "qqq" / "m_xxx,qqq" → ["m_xxx", "qqq"]；留空 = 该账号全部机器
@@ -229,26 +245,106 @@ function resolve(c, name) {
 }
 
 // ---- 面板配置（KV: CONFIG） --------------------------------------------------
-// accounts["2"] = { enabled: true, mode: "all" | "list", machines: ["m_x", ...] }
+// accounts["2"] = { enabled: true, mode: "all" | "list", machines: ["m_x", ...], skip: ["m_y"] }
 //   mode=all  该账号下所有机器都保活
 //   mode=list 只保活 machines 里列出的（空数组 = 一台都不保活）
+//   skip      点名不保活的机器（叠在 mode 之上，优先级最高）
 // 没有该账号的条目 = 沿用环境变量（INSTABOX_MACHINE / 全部），行为与旧版完全一致
+//
+// skip 是给 Telegram 机器人用的：机器人把某台 suspend/stop 掉之后要让它真的
+// 保持关闭，而 mode=all 的账号没法用白名单表达「除了这台」—— 硬改成 list 又会让
+// 以后新建的机器默认不保活。加一层 skip 就两边都照顾到了。
 function blankConfig() {
-  return { v: 1, paused: false, accounts: {} };
+  return {
+    v: 1,
+    paused: false,
+    window: { on: false, start: 480, end: 1380, maxMin: 0 },
+    telegram: null,
+    accounts: {},
+  };
+}
+
+// Telegram 机器人的配置。存在 CONFIG 里是为了让「网页面板直接配 bot」成为可能：
+// Worker 改不了自己的环境变量/Secret，面板填的值只能落到 KV。
+// 每个字段为空 = 不覆盖，回退到同名环境变量（老部署完全不受影响）。
+function normalizeTelegram(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const token = String(raw.token || "").trim();
+  const secret = String(raw.secret || "").trim();
+  const chats = (Array.isArray(raw.chats) ? raw.chats : String(raw.chats || "").split(/[,\s]+/))
+    .map((s) => String(s).trim())
+    .filter(Boolean);
+  // 一个字段都没填就当没配过，免得留一个空壳让「来源」判断出错
+  if (!token && !secret && !chats.length) return null;
+  return { token, secret, chats };
+}
+
+// 保活区间：只在这段时间里续租，其余时间放掉租约让机器按平台规则休眠。
+//   on     时间段开关（关掉 = 全天保活，只受 maxMin 约束）
+//   start  开始，当天第几分钟（480 = 08:00）；start > end 表示跨午夜
+//   end    结束，同一套算法；start === end 表示全天
+//   maxMin 单次最长保活分钟数，0 = 不限。从「进入区间」那一刻开始算
+// 时间一律按北京时间（UTC+8）解释：Worker 内部跑 UTC，换算在这里做。
+const BJT_OFFSET_MIN = 480;
+
+function clampMin(value, fallback) {
+  const n = Number.parseInt(value, 10);
+  return Number.isFinite(n) && n >= 0 && n < 1440 ? n : fallback;
+}
+
+function normalizeWindow(raw) {
+  const out = { on: false, start: 480, end: 1380, maxMin: 0 };
+  if (!raw || typeof raw !== "object") return out;
+  out.on = raw.on === true;
+  out.start = clampMin(raw.start, out.start);
+  out.end = clampMin(raw.end, out.end);
+  const m = Number.parseInt(raw.maxMin, 10);
+  if (Number.isFinite(m) && m >= 0) out.maxMin = Math.min(m, 1440);
+  return out;
+}
+
+// 北京时间现在是第几分钟（0-1439）
+function bjMinute(now = new Date()) {
+  const utc = now.getUTCHours() * 60 + now.getUTCMinutes();
+  return (((utc + BJT_OFFSET_MIN) % 1440) + 1440) % 1440;
+}
+
+const hhmm = (min) => `${String(Math.floor(min / 60)).padStart(2, "0")}:${String(min % 60).padStart(2, "0")}`;
+
+function windowLabel(w) {
+  if (!w || !w.on) return w && w.maxMin ? `全天（单次上限 ${w.maxMin} 分钟）` : "全天";
+  const span = w.start === w.end ? "全天" : `${hhmm(w.start)}–${hhmm(w.end)}`;
+  return w.maxMin ? `${span}（单次上限 ${w.maxMin} 分钟）` : span;
+}
+
+// 现在在不在保活区间里。没开时间段就永远算「在」。
+function inWindow(w, now = new Date()) {
+  if (!w || !w.on) return true;
+  if (w.start === w.end) return true;
+  const m = bjMinute(now);
+  return w.start < w.end ? m >= w.start && m < w.end : m >= w.start || m < w.end;
 }
 
 function normalizeConfig(raw) {
   const out = blankConfig();
   if (!raw || typeof raw !== "object") return out;
   out.paused = raw.paused === true;
+  out.window = normalizeWindow(raw.window);
+  out.telegram = normalizeTelegram(raw.telegram);
   const src = raw.accounts && typeof raw.accounts === "object" ? raw.accounts : {};
   for (const [k, v] of Object.entries(src)) {
     const n = Number.parseInt(k, 10);
     if (!Number.isSafeInteger(n) || n < 1 || !v || typeof v !== "object") continue;
     const machines = Array.isArray(v.machines) ? v.machines.map(String).filter(Boolean) : [];
+    const skip = Array.isArray(v.skip) ? v.skip.map(String).filter(Boolean) : [];
     // 兼容早期只写 machines 的形态：有列表就算白名单
     const mode = v.mode === "list" || (v.mode === undefined && machines.length) ? "list" : "all";
-    out.accounts[String(n)] = { enabled: v.enabled !== false, mode, machines: mode === "list" ? machines : [] };
+    out.accounts[String(n)] = {
+      enabled: v.enabled !== false,
+      mode,
+      machines: mode === "list" ? machines : [],
+      skip: skip.filter((id) => !(mode === "list" && machines.includes(id))),
+    };
   }
   return out;
 }
@@ -282,10 +378,103 @@ async function saveConfig(c, conf) {
 
 const accountConf = (conf, n) => conf.accounts[String(n)] || null;
 
+// ---- 保活区间的运行状态 ------------------------------------------------------
+// 存在 CONFIG KV 的 win 键（没绑就退化成 isolate 内存，够单实例用）：
+//   { phase: "keep" | "idle" | "capped", startedAt: ISO|null, at: ISO }
+// phase 变了才写，所以一天也就进出区间那几次，不占 KV 额度。
+// startedAt 是「本次进入区间」的时间，单次上限从它开始算 —— 跨 cron 轮次要记住，
+// 否则每轮都会重新计时，上限永远触发不了。
+const WIN_KEY = "win";
+const winMemo = new Map();
+
+async function loadWinState(c) {
+  const blank = { phase: "keep", startedAt: null, at: null };
+  if (!c.cfgKv) return winMemo.get("state") || blank;
+  try {
+    const v = JSON.parse((await c.cfgKv.get(WIN_KEY)) || "null");
+    if (!v || typeof v !== "object") return blank;
+    return { phase: String(v.phase || "keep"), startedAt: v.startedAt || null, at: v.at || null };
+  } catch {
+    return blank;
+  }
+}
+
+async function saveWinState(c, v) {
+  if (!c.cfgKv) {
+    winMemo.set("state", v);
+    return;
+  }
+  try {
+    await c.cfgKv.put(WIN_KEY, JSON.stringify(v), { expirationTtl: 604800 });
+  } catch {}
+}
+
+// 算这一轮该不该保活。返回 { phase, startedAt, inWindow, limitMin, over }
+//   idle   —— 不在时间段内
+//   capped —— 在时间段内，但单次保活已经用满 maxMin
+//   keep   —— 正常保活
+function winPhase(conf, st, now) {
+  const w = conf.window || normalizeWindow(null);
+  if (!inWindow(w, new Date(now))) {
+    return { phase: "idle", startedAt: null, inWindow: false, limitMin: w.maxMin || 0, over: false };
+  }
+  // 刚从区间外进来（或第一次跑）→ 重新计时
+  const fresh = st.phase === "idle" || !st.startedAt;
+  const startedAt = fresh ? new Date(now).toISOString() : st.startedAt;
+  const limitMin = w.maxMin || 0;
+  const over = limitMin > 0 && now - new Date(startedAt).getTime() >= limitMin * 60000;
+  return { phase: over ? "capped" : "keep", startedAt, inWindow: true, limitMin, over };
+}
+
+// 给面板 / 机器人看的一屏信息
+function windowView(conf, ph, st) {
+  const w = conf.window || normalizeWindow(null);
+  return {
+    on: !!w.on,
+    start: w.start,
+    end: w.end,
+    maxMin: w.maxMin || 0,
+    startAt: hhmm(w.start),
+    endAt: hhmm(w.end),
+    label: windowLabel(w),
+    phase: ph.phase,
+    inWindow: ph.inWindow,
+    startedAt: ph.startedAt,
+    keptMin: ph.startedAt ? Math.max(0, Math.round((Date.now() - new Date(ph.startedAt).getTime()) / 60000)) : 0,
+    nowAt: hhmm(bjMinute()),
+    tz: "UTC+8",
+  };
+}
+
+// 机器人 / 面板用：只读区间状态，不列机器（省子请求）
+async function windowInfo(c) {
+  const { conf, error } = await loadConfig(c);
+  if (error) return { error };
+  const st = await loadWinState(c);
+  return windowView(conf, winPhase(conf, st, Date.now()), st);
+}
+
+// 改区间。走和 /api/config 同一套 normalize，非法值会被收敛回默认。
+async function patchWindow(c, patch) {
+  if (!c.cfgKv) return { ok: false, error: "没绑 CONFIG KV，区间存不下来" };
+  const { conf, error } = await loadConfig(c);
+  if (error) return { ok: false, error };
+  conf.window = normalizeWindow({ ...conf.window, ...patch });
+  await saveConfig(c, conf);
+  // 区间变了就把运行状态清掉，否则旧的 startedAt 会让新的单次上限立刻触顶
+  try {
+    await c.cfgKv.delete(WIN_KEY);
+  } catch {}
+  winMemo.delete("state");
+  return { ok: true, window: conf.window };
+}
+
 // 这台机器该不该保活：没配条目 = 全保（沿用环境变量行为）
 function selected(ac, id) {
   if (!ac) return true;
   if (ac.enabled === false) return false;
+  // skip 优先于 mode：Telegram 机器人关掉的机器，就算 mode=all 也不再续租
+  if (Array.isArray(ac.skip) && ac.skip.includes(id)) return false;
   if (ac.mode === "list") return ac.machines.includes(id);
   return true;
 }
@@ -317,27 +506,43 @@ function timeoutSignal(ms) {
   }
 }
 
-// 从错误体里取平台给的提示：code / retryable / retryAfterSeconds。
+// 从错误体里取平台给的提示：code / retryable / retryAfterSeconds / operationId。
 // 官方文档：暂时性错误在 body 里带 retryable，需要等待的还带 retryAfterSeconds
 // （no_capacity 是 60 秒），同一个值也会放进 Retry-After 响应头。
+// operationId 指向「正在这台机器上跑的那个操作」—— 撞上它时等它比盲重试准。
 function errInfo(r) {
   const e = r && r.json && r.json.error;
-  if (!e || typeof e !== "object") return { code: "", retryable: false, after: 0 };
+  if (!e || typeof e !== "object") return { code: "", retryable: false, after: 0, opId: "" };
   const after = Number(e.retryAfterSeconds);
   return {
     code: String(e.code || ""),
     retryable: e.retryable === true,
     after: Number.isFinite(after) && after > 0 ? after : 0,
+    opId: String(e.operationId || ""),
   };
 }
 
-// 409 里有两个是「等一下就好的」，和 machine_not_running 不是一回事：
+// 409 里只有 operation_conflict 值得在「这一次请求内」等几秒：
 //   operation_conflict —— 另一个操作正在跑（平台的自动 suspend、你手动 pause/stop、
 //                        上一轮的 resume 还没结束）
-//   machine_cooldown   —— 机器刚变更完，还在冷却
-// 以前只认 not_running，这两种既没重试也没唤醒，直接记一条失败 —— 这就是
-// 「有时候续租失败、下一轮又自己好了」的主要来源。
-const TRANSIENT_409 = new Set(["operation_conflict", "machine_cooldown"]);
+//   machine_cooldown   —— 机器在休息，官方给的是分钟级（免费版连续 max-run 能到 2 小时），
+//                        在请求里等几秒纯属浪费子请求预算，单独上报，别混进重试
+// 以前把 machine_cooldown 也当暂时性错误重试，等于每轮白扔两次请求还是失败。
+const TRANSIENT_409 = new Set(["operation_conflict"]);
+
+// 机器在冷却（max-run 到点、或安全审查锁住），任何唤醒方式都会被拒，只能等
+const COOLDOWN_CODE = "machine_cooldown";
+const isCooling = (r) => r.status === 409 && errInfo(r).code === COOLDOWN_CODE;
+
+// 秒数说人话：冷却 5-20 分钟、免费版连坐能到 2 小时
+function fmtDur(sec) {
+  const s = Math.max(0, Math.round(Number(sec) || 0));
+  if (s < 60) return `${s} 秒`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} 分钟`;
+  const h = Math.floor(m / 60);
+  return `${h} 小时${m % 60 ? ` ${m % 60} 分钟` : ""}`;
+}
 
 // 单次等待上限：cron 一次调用有时长上限，不能真按 60 秒睡过去。
 // 等不起就留给下一轮 —— 下一轮只有几分钟，比把这次拖死强。
@@ -419,13 +624,15 @@ async function machines(acc, opts = {}) {
         continue;
       }
       const r = await call(acc, "GET", `/v1/machines/${encodeURIComponent(one)}`);
-      if (r.ok && r.json?.id) list.push({ id: r.json.id, name: r.json.name || one, state: r.json.state || "" });
+      if (r.ok && r.json?.id) list.push({ id: r.json.id, name: r.json.name || one, state: r.json.state || "", raw: r.json });
       else missing.push(one);
     }
   } else {
     const r = await call(acc, "GET", "/v1/machines");
     if (r.ok) {
-      for (const m of r.json?.machines || []) list.push({ id: m.id, name: m.name, state: m.state || "" });
+      // 列表返回的就是完整机器对象，顺手带在 raw 上：面板和机器人要看的
+      // cooldownUntil / maxRunMinutes 都在里面，不用再逐台 GET 一遍
+      for (const m of r.json?.machines || []) list.push({ id: m.id, name: m.name, state: m.state || "", raw: m });
     } else {
       error = `列机器失败：HTTP ${r.status} ${(r.text || "").slice(0, 160)}`;
     }
@@ -635,16 +842,29 @@ async function sendAlert(c, text) {
   }
 }
 
+// 冷却中的机器不是故障：平台在让它休息（max-run 到点，或安全审查锁住）。
+// 它们会让这一轮 ok=false，但不该按「保活挂了」去告警 —— 否则免费版每天跑满
+// 8 小时后会连着几小时每 30 分钟弹一条，真正的故障反而被淹掉。
+const coolingOf = (out) => (out.machines || []).filter((m) => m.cooling);
+const hardFailsOf = (out) => (out.machines || []).filter((m) => (m.ok === false || m.error) && !m.cooling);
+
 function failText(out, fails) {
   const lines = [`[InstaBox 保活失败] ${alertStamp()}`];
   if (out.error) lines.push(`错误：${out.error}`);
-  const bad = (out.machines || []).filter((m) => m.ok === false || m.error);
+  const bad = hardFailsOf(out);
   if (bad.length) {
     lines.push(`${bad.length} 台续租失败：`);
     for (const m of bad.slice(0, 8)) {
       lines.push(`· #${m.account} ${m.machine || m.id}${m.error ? "：" + String(m.error).slice(0, 140) : ""}`);
     }
     if (bad.length > 8) lines.push(`…还有 ${bad.length - 8} 台`);
+  }
+  const cooling = coolingOf(out);
+  if (cooling.length) {
+    lines.push(`${cooling.length} 台在冷却（平台限制，会自己恢复）：`);
+    for (const m of cooling.slice(0, 4)) {
+      lines.push(`· #${m.account} ${m.machine || m.id}${m.cooling ? `，约 ${fmtDur(m.cooling)}后` : ""}`);
+    }
   }
   for (const a of out.accounts || []) if (a.error) lines.push(`· #${a.account}：${a.error}`);
   if (fails > 1) lines.push(`已连续失败 ${fails} 次`);
@@ -654,9 +874,19 @@ function failText(out, fails) {
 async function notify(c, out) {
   if (!c.alertUrl) return;
   if (out.paused) return; // 主动暂停不算故障
+  // 区间外/触顶跳过的那一轮什么也没干，不该动告警状态机
+  if (out.skipped) return;
 
   const prev = await loadAlert(c);
   const now = Date.now();
+
+  // 只有冷却、没有别的故障：这不是保活坏了，是平台在让机器休息。
+  // 不报警，也不发「已恢复」，只把连续失败计数清掉（否则冷却结束后的
+  // 第一条真实故障会被「已连续失败 N 次」的旧计数误导）。
+  if (coolingOf(out).length && !hardFailsOf(out).length && !out.error) {
+    if (prev.state === "fail" || prev.fails) await saveAlert(c, { state: "ok", fails: 0, sentAt: prev.sentAt || 0 });
+    return;
+  }
 
   if (out.ok) {
     if (prev.state === "fail") {
@@ -720,38 +950,141 @@ async function act(c, id, type) {
   return last;
 }
 
-async function stateOf(c, id) {
-  const r = await call(c, "GET", `/v1/machines/${encodeURIComponent(id)}`);
-  return r.ok ? r.json?.state || "" : "";
+// 等一个 operation 跑完。官方推荐做法：GET /v1/operations/{id}?wait=25s ——
+// 请求会一直挂到操作有变化或超时（wait 最长 30 秒），所以循环里不用再自己 sleep。
+// 一次生命周期调用只对应一个操作，等它结束再动这台机器，比反复猜状态准得多。
+// 返回 { ok, state, machine, error, timedOut }：
+//   ok=true            → succeeded，机器已经是新状态
+//   ok=false, timedOut → 还没跑完（下一轮接着来，不算失败）
+//   ok=false, 其它      → failed，error 里有平台给的原因
+async function waitOp(c, opId, maxWaitMs) {
+  if (!opId) return { ok: false, timedOut: false, error: "没有 operationId" };
+  const deadline = Date.now() + Math.max(1000, Number(maxWaitMs) || 30000);
+  let last = { ok: false, timedOut: false, error: "没等到操作完成" };
+  while (Date.now() < deadline) {
+    if (!spend(c)) return { ok: false, timedOut: true, error: "子请求预算用完，没等到操作完成" };
+    // 剩下的时间决定这次 wait 多久：别让最后一次轮询白等 25 秒
+    const left = Math.max(1, Math.min(25, Math.ceil((deadline - Date.now()) / 1000)));
+    const r = await call(c, "GET", `/v1/operations/${encodeURIComponent(opId)}?wait=${left}s`, null, { retries: 0 });
+    if (!r.ok) {
+      // 查操作失败不一定是操作失败（可能只是这一次读挂了），当超时处理更安全
+      return { ok: false, timedOut: true, error: `查操作失败 HTTP ${r.status}` };
+    }
+    const st = String(r.json?.state || "");
+    if (st === "succeeded") return { ok: true, state: st, machine: r.json?.machine };
+    if (st === "failed") {
+      const e = r.json?.error;
+      return { ok: false, state: st, error: (e && (e.message || e.code)) || "操作失败" };
+    }
+    last = { ok: false, timedOut: true, error: `操作还在 ${st || "进行中"}` };
+  }
+  return last;
 }
 
-// 挂了就先唤醒再续租：resume 优先，stopped 的用 start 兜底；running 后立刻续租一次。
-// 等待窗口可配（WAKE_TRIES × WAKE_GAP），默认 6×5s=30s —— 机器启动慢的时候别急着判失败。
-// 一次完整唤醒最坏要 WAKE_COST 个子请求：2 次 resume/start + 6 次轮询 + 2 次续租（含重试）。
-const WAKE_COST = 10;
+// 等唤醒的总窗口。沿用老的 WAKE_TRIES × WAKE_GAP 语义（默认 6×5=30 秒），
+// 只是从「自己 sleep 着轮询」换成「让服务端挂着等」，省掉五次多余请求。
+const wakeWaitMs = (c) => Math.max(5000, Math.min(55000, (c.wakeTries || 6) * (c.wakeGap || 5) * 1000));
 
-async function wakeThenLease(c, m) {
+// 唤醒一台挂起/停掉的机器，成功后立刻续租。
+//
+// 官方文档（docs/idle-suspend「What wakes a machine」）把情况分得很清楚，照它走
+// 比「resume 失败再 start 兜底」省请求也准得多：
+//   · 自己空闲挂起的（autoSuspendedAt 有值）→ POST /wake，服务端替我们等最多 45 秒
+//   · 你手动 suspend 的                     → /wake 不管用，得 /resume
+//   · stopped 的                            → /start（冷启动）
+// 一次完整唤醒最坏 WAKE_COST 个子请求：1 次读机器 + 2 次尝试 + 1 次等操作 + 2 次续租。
+const WAKE_COST = 8;
+
+const leaseAfterWake = async (c, id, wake) => {
+  const r = await lease(c, id);
+  return r.ok
+    ? { ok: true, resumed: true, expiresAt: r.json?.expiresAt, wake }
+    : { ok: false, resumed: true, status: r.status, error: r.text.slice(0, 200), wake };
+};
+
+// 冷却中不是故障：平台在让机器休息（max-run 到点或安全审查锁住），叫也叫不醒
+const coolingResult = (r, wake) => {
+  const after = errInfo(r).after;
+  return {
+    ok: false,
+    resumed: false,
+    cooling: after || 0,
+    status: 409,
+    error: after ? `机器在冷却，约 ${fmtDur(after)}后可唤醒（平台限制，不是故障）` : "机器在冷却，平台暂不让唤醒",
+    wake,
+  };
+};
+
+// 响应是 202 + operation，还是 200 + machine，决定要不要等
+const isOperation = (j) => typeof j?.id === "string" && j.id.startsWith("op_");
+
+async function wakeThenLease(c, m, depth = 0) {
   const wake = [];
-  for (const type of ["resume", "start"]) {
-    const a = await act(c, m.id, type);
+  const id = m.id;
+
+  // 先花一次 GET 问清楚状态：这次读到的 state 决定走哪条唤醒路径
+  const cur = await call(c, "GET", `/v1/machines/${encodeURIComponent(id)}`);
+  const info = cur.ok ? cur.json || {} : {};
+  const state = String(info.state || "").toLowerCase();
+
+  // 上一轮的唤醒刚好生效了
+  if (state === "running") return leaseAfterWake(c, id, ["already-running"]);
+
+  // 平台正在变状态：等它自己走完（机器对象上带着当前 operationId）
+  if (["starting", "stopping", "suspending", "resuming", "creating"].includes(state)) {
+    const w = await waitOp(c, info.operationId, wakeWaitMs(c));
+    if (!w.ok) {
+      return { ok: false, resumed: false, status: 409, error: `机器正在 ${state}：${w.error}`, wake: [`state:${state}`] };
+    }
+    // 等完可能变成了另一个状态（suspending → suspended、stopping → stopped），
+    // 那就得按新状态再走一遍，不能直接续租。depth 兜住来回弹的情况。
+    if (depth < 2) return wakeThenLease(c, m, depth + 1);
+    return { ok: false, resumed: false, status: 409, error: `机器还在变状态（${state}）`, wake: [`state:${state}`] };
+  }
+
+  const autoPaused = state === "suspended" && !!info.autoSuspendedAt;
+  const order = autoPaused ? ["wake"] : state === "stopped" ? ["start"] : ["resume", "start"];
+
+  let last = { ok: false, status: 0, text: "" };
+  for (const type of order) {
+    const a = await act(c, id, type);
     wake.push(`${type}:${a.status}`);
-    if (a.ok) break;
-  }
-  for (let i = 0; i < c.wakeTries; i++) {
-    // 预算见底就停止轮询：机器已经醒了，把剩下的额度留给后面几台的续租，
-    // 下一轮 cron 会补上（机器醒着就不会再挂）
-    if (c.budget && c.budget.left < 2) {
-      return { ok: false, resumed: true, status: 0, error: "子请求预算用完，已唤醒但没等到 running（下一轮继续）", wake };
+    last = a;
+
+    if (a.ok) {
+      // /wake 等到 running 才返回（200 + machine）；resume/start 返回 202 + operation，要等
+      if (isOperation(a.json)) {
+        const w = await waitOp(c, a.json.id, wakeWaitMs(c));
+        if (!w.ok) {
+          return {
+            ok: false,
+            resumed: true,
+            status: 409,
+            error: `已${type}，${w.error}（下一轮再续）`,
+            wake,
+          };
+        }
+      }
+      return leaseAfterWake(c, id, wake);
     }
-    await sleep(c.wakeGap * 1000);
-    if ((await stateOf(c, m.id)) === "running") {
-      const r = await lease(c, m.id);
-      return r.ok
-        ? { ok: true, resumed: true, expiresAt: r.json?.expiresAt, wake }
-        : { ok: false, resumed: true, status: r.status, error: r.text.slice(0, 200), wake };
+
+    if (isCooling(a)) return coolingResult(a, wake);
+
+    // 别的操作正在这台机器上跑：错误体里带着 operationId，等它比盲重试准。
+    // 等完重新评估一次（它可能正是那个把它挂起的操作）。
+    if (a.status === 409) {
+      const w = await waitOp(c, errInfo(a).opId, wakeWaitMs(c));
+      if (w.ok && depth < 2) return wakeThenLease(c, m, depth + 1);
     }
   }
-  return { ok: false, resumed: true, status: 409, error: "已发唤醒，机器还没 running（下一轮再续）", wake };
+
+  return {
+    ok: false,
+    resumed: true,
+    status: last.status || 409,
+    error: (last.text || "").slice(0, 200) || "已发唤醒，机器还没 running（下一轮再续）",
+    wake,
+  };
 }
 
 const noMachine = (acc) =>
@@ -788,6 +1121,9 @@ async function keepaliveAccount(acc, conf) {
       const r = await lease(acc, m.id);
       if (r.ok) {
         results.push({ ...item, ok: true, expiresAt: r.json?.expiresAt });
+      } else if (isCooling(r)) {
+        // 平台让机器休息（max-run 到点 / 安全审查锁住）：等多少秒它说了算，别硬顶
+        results.push({ ...item, ...coolingResult(r, []) });
       } else if (acc.autoResume && isNotRunning(r)) {
         // 被挂起了：续租是空转，先把它弄醒再续。
         // 但唤醒要花掉最多 WAKE_COST 个请求，预算不够就别开这个头 ——
@@ -826,6 +1162,45 @@ async function keepalive(c, opts = {}) {
   if (conf.paused && !opts.force) {
     // 暂停期间 cron 直接跳过：不写 KV、不打 API，省额度也省日志
     return { ok: true, paused: true, at: new Date().toISOString(), count: 0, accounts: [], machines: [] };
+  }
+
+  // ---- 保活区间 --------------------------------------------------------------
+  // 手动触发（面板「全部续租」/ 机器人 /wake）不受区间限制：人就在旁边按的，
+  // 按下去就该生效。只有 cron 那一轮才看区间。
+  const now = Date.now();
+  const prevWin = await loadWinState(c);
+  const ph = winPhase(conf, prevWin, now);
+  if (!opts.force) {
+    if (ph.phase !== "keep") {
+      // 刚离开区间（或刚触顶）的那一轮：主动把租约放掉，别让机器干等 TTL 过期。
+      // 只在这一轮做一次 —— 否则每 5 分钟一个 DELETE，纯浪费。
+      if (prevWin.phase !== ph.phase && prevWin.phase === "keep") {
+        try {
+          await release(c, opts.account);
+        } catch (e) {
+          console.log("instabox-keepalive: 区间外放租约失败", e.message);
+        }
+      }
+      if (prevWin.phase !== ph.phase || prevWin.startedAt !== ph.startedAt) {
+        await saveWinState(c, { phase: ph.phase, startedAt: ph.startedAt, at: new Date(now).toISOString() });
+      }
+      const why =
+        ph.phase === "idle"
+          ? `不在保活区间（${windowLabel(conf.window)}，现在 ${hhmm(bjMinute())}）`
+          : `本轮保活已用满 ${ph.limitMin} 分钟上限（从 ${hhmm(bjMinute(new Date(ph.startedAt)))} 算起）`;
+      return {
+        ok: true,
+        skipped: why,
+        window: windowView(conf, ph, prevWin),
+        at: new Date(now).toISOString(),
+        count: 0,
+        accounts: [],
+        machines: [],
+      };
+    }
+    if (prevWin.phase !== "keep" || prevWin.startedAt !== ph.startedAt) {
+      await saveWinState(c, { phase: "keep", startedAt: ph.startedAt, at: new Date(now).toISOString() });
+    }
   }
 
   const { picked, error } = resolve(c, opts.account);
@@ -887,6 +1262,8 @@ async function status(c, account) {
                 state: r.json?.state,
                 autoSuspendAfterSeconds: r.json?.autoSuspendAfterSeconds,
                 autoSuspendedAt: r.json?.autoSuspendedAt ?? null,
+                cooldownUntil: r.json?.cooldownUntil ?? null,
+                maxRunMinutes: r.json?.maxRunMinutes ?? null,
               }
             : { machine: m.name, id: m.id, error: `HTTP ${r.status}` },
         );
@@ -958,9 +1335,18 @@ function maskKey(key) {
   return key.length <= 8 ? "****" : `${key.slice(0, 4)}…${key.slice(-4)}`;
 }
 
+// webhook 路径里的随机串：面板没填时自动补一个，别让 /tg 变成谁都能打的公开接口
+function randomHex(bytes = 16) {
+  const buf = new Uint8Array(bytes);
+  crypto.getRandomValues(buf);
+  return Array.from(buf, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 // 面板一屏要的东西：账号（打码）+ 全部机器 + 配置 + 最近一次续租结果
 async function state(c) {
   const { conf, error: confError } = await loadConfig(c);
+  const winSt = await loadWinState(c);
+  const win = windowView(conf, winPhase(conf, winSt, Date.now()), winSt);
   let live = null;
   if (c.cfgKv) {
     try {
@@ -1003,7 +1389,7 @@ async function state(c) {
       ttl: acc.ttl,
       autoResume: acc.autoResume,
       envMachine: acc.machine,
-      conf: ac ? { enabled: ac.enabled, mode: ac.mode, machines: ac.machines } : null,
+      conf: ac ? { enabled: ac.enabled, mode: ac.mode, machines: ac.machines, skip: ac.skip || [] } : null,
       count: list.length,
       error: err,
     });
@@ -1017,6 +1403,10 @@ async function state(c) {
         selected: selectedFor(ac, acc, m),
         expiresAt: l?.expiresAt || null,
         lastRenewAt: live?.at || null,
+        // 下面三个来自列表里的完整机器对象（没拿到就是 null，面板照常显示）
+        autoSuspendedAt: m.raw?.autoSuspendedAt || null,
+        cooldownUntil: m.raw?.cooldownUntil || null,
+        maxRunMinutes: m.raw?.maxRunMinutes ?? null,
       });
     }
   }
@@ -1026,6 +1416,8 @@ async function state(c) {
     version: VERSION,
     at: new Date().toISOString(),
     paused: conf.paused,
+    window: win,
+    telegram: tgView(tgConfig(c.env || {}, conf), !!c.cfgKv),
     canSave: !!c.cfgKv,
     alertOn: !!c.alertUrl,
     logMode: c.logMode,
@@ -1050,6 +1442,30 @@ async function updateConfig(c, body) {
   }
   if (typeof body.paused === "boolean") conf.paused = body.paused;
 
+  // 保活区间：只传要改的字段就行，其余保持不变
+  if (body.window && typeof body.window === "object") {
+    conf.window = normalizeWindow({ ...conf.window, ...body.window });
+  }
+
+  // Telegram：null = 清掉网页里的覆盖、回退环境变量；
+  // 对象里没出现的字段保持原值，传空串/空数组才是「清空这一项」
+  if (body.telegram === null || body.telegram === "reset") {
+    conf.telegram = null;
+  } else if (body.telegram && typeof body.telegram === "object") {
+    const t = body.telegram;
+    const prev = conf.telegram || { token: "", secret: "", chats: [] };
+    const has = (k) => Object.prototype.hasOwnProperty.call(t, k);
+    conf.telegram = normalizeTelegram({
+      token: has("token") ? String(t.token || "").trim() : prev.token,
+      secret: has("secret") ? String(t.secret || "").trim() : prev.secret,
+      chats: has("chats")
+        ? Array.isArray(t.chats)
+          ? t.chats
+          : String(t.chats || "").split(/[,\s]+/)
+        : prev.chats,
+    });
+  }
+
   if (body.accounts && typeof body.accounts === "object") {
     for (const [k, v] of Object.entries(body.accounts)) {
       const n = Number.parseInt(k, 10);
@@ -1061,8 +1477,14 @@ async function updateConfig(c, body) {
         continue;
       }
       if (!v || typeof v !== "object") continue;
-      const prev = conf.accounts[key] || { enabled: true, mode: "all", machines: [] };
-      const next = { enabled: typeof v.enabled === "boolean" ? v.enabled : prev.enabled, mode: prev.mode, machines: prev.machines };
+      const prev = conf.accounts[key] || { enabled: true, mode: "all", machines: [], skip: [] };
+      // skip 是机器人维护的，面板改开关时原样带着走，别把「关掉的机器」又放回保活
+      const next = {
+        enabled: typeof v.enabled === "boolean" ? v.enabled : prev.enabled,
+        mode: prev.mode,
+        machines: prev.machines,
+        skip: prev.skip || [],
+      };
       if (v.mode === "all") {
         next.mode = "all";
         next.machines = [];
@@ -1077,7 +1499,17 @@ async function updateConfig(c, body) {
   }
 
   await saveConfig(c, conf);
-  return { ok: true, config: normalizeConfig(conf), canSave: true };
+  // 区间改了就把运行状态清掉：否则旧的 startedAt 会让新的单次上限立刻触顶
+  if (body.window) {
+    try {
+      await c.cfgKv.delete(WIN_KEY);
+    } catch {}
+    winMemo.delete("state");
+  }
+  // 返回给前端前把 token/secret 抹掉：明文只在 KV 和 Worker 内存里待着
+  const clean = normalizeConfig(conf);
+  if (clean.telegram) clean.telegram = { token: "", secret: "", chats: clean.telegram.chats };
+  return { ok: true, config: clean, telegram: tgView(tgConfig(c.env || {}, conf), true), canSave: true };
 }
 
 async function machineAction(c, body) {
@@ -1556,6 +1988,24 @@ function safeEqual(a, b) {
 const guardWrite = (request) =>
   request.method === "POST" && !sameOrigin(request) ? jsonReply({ ok: false, error: "来源不对" }, 403) : null;
 
+// 给 telegram.js 用的门面：机器人模块不 import 本文件（那会循环依赖），
+// 改由这里把要用的函数注入进去。放在最后是因为下面的 lease / act 都是 const。
+const TG_HELPERS = {
+  state,
+  loadConfig,
+  saveConfig,
+  machines,
+  call,
+  act,
+  lease,
+  wakeThenLease,
+  waitOp,
+  patchLive,
+  clearLive,
+  windowInfo,
+  patchWindow,
+};
+
 export default {
   async scheduled(_event, env) {
     const c = cfg(env);
@@ -1596,6 +2046,12 @@ export default {
       if (request.method !== "POST") return jsonReply({ ok: false, error: "请用 POST" }, 405);
       if (!sameOrigin(request)) return jsonReply({ ok: false, error: "来源不对" }, 403);
       return jsonReply({ ok: true }, 200, sessionCookie(request, "", 0));
+    }
+
+    // ---- Telegram webhook：不带面板凭据，靠路径里的随机串 + Telegram 的 secret 头认证 ----
+    // 必须放在 whoIs 之前，否则 Telegram 会被登录页挡掉
+    if (route === "/tg" || route.startsWith("/tg/")) {
+      return handleTelegram(request, env, c, TG_HELPERS, url);
     }
 
     // ---- 其余全部要身份：面板路由没登录就跳登录页，接口没登录给 401
@@ -1758,6 +2214,46 @@ export default {
       if (bad) return bad;
       const out = await machineAction(c, await readJson(request));
       return jsonReply(out, out.ok ? 200 : 502);
+    }
+
+    if (route === "/api/telegram") {
+      if (request.method === "POST") {
+        const bad = guardWrite(request);
+        if (bad) return bad;
+        const body = await readJson(request);
+        if (body && Object.prototype.hasOwnProperty.call(body, "telegram")) {
+          const saved = await updateConfig(c, { telegram: body.telegram });
+          if (!saved.ok) return jsonReply(saved, 400);
+        }
+        // 刚存的值要立刻生效：重新读一次，别用进来时那份旧配置
+        let fresh = await loadConfig(c);
+        let now = tgConfig(env, fresh.error ? null : fresh.conf);
+
+        // 有 token 却没有 secret = /tg 裸奔：任何人都能 POST 一个伪造 update 去关机
+        // （chat id 是请求体里写的，挡不住伪造）。面板这条路自动补一个，别让用户
+        // 因为「那个框没填」就留个后门。环境变量那条路没法自动补，只能在文档里讲清楚。
+        let secretGenerated = false;
+        if (now.token && !now.secret && c.cfgKv) {
+          const gen = randomHex(16);
+          const fixed = await updateConfig(c, { telegram: { secret: gen } });
+          if (fixed.ok) {
+            fresh = await loadConfig(c);
+            now = tgConfig(env, fresh.error ? null : fresh.conf);
+            secretGenerated = true;
+          }
+        }
+
+        if (body && body.register) {
+          // telegramAdmin 的 action 是从 URL 上读的，POST 这条路上自己拼一个
+          const setUrl = new URL(url.origin + "/api/telegram");
+          setUrl.searchParams.set("action", "set");
+          const r = await telegramAdmin(env, setUrl, now);
+          return jsonReply({ ...r, secretGenerated, telegram: tgView(now, !!c.cfgKv) }, r.ok ? 200 : 502);
+        }
+        return jsonReply({ ok: true, secretGenerated, telegram: tgView(now, !!c.cfgKv) });
+      }
+      const { conf: tgRaw, error: tgErr } = await loadConfig(c);
+      return jsonReply(await telegramAdmin(env, url, tgConfig(env, tgErr ? null : tgRaw)));
     }
 
     if (route.startsWith("/api/")) return jsonReply({ ok: false, error: `没有这个接口：${route}` }, 404);

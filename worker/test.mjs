@@ -26,17 +26,35 @@ function fakeKV(opts = {}) {
 }
 
 const machineState = { m_1: "running", m_2: "suspended", m_3: "running" };
+// 自己空闲挂起的机器（autoSuspendedAt 有值）和「你手动 suspend 的」走的是两条路：
+// 前者 /wake 管用，后者只能 /resume。这个集合用来区分。
+const autoPaused = new Set();
+// id -> 冷却剩余秒数：平台让机器休息时，任何唤醒都回 409 machine_cooldown
+const cooldowns = {};
 
 // 每个 key 名下的机器。/api/state 会按账号逐个列机器，假 API 也要照做。
 const machinesByKey = () => ({
   ibk_test_key: [
-    { id: "m_1", name: "qqq", state: machineState.m_1 },
-    { id: "m_2", name: "box2", state: machineState.m_2 },
+    {
+      id: "m_1",
+      name: "qqq",
+      state: machineState.m_1,
+      autoSuspendedAt: autoPaused.has("m_1") ? "2026-11-03T01:00:00Z" : null,
+      cooldownUntil: cooldowns.m_1 ? new Date(Date.now() + cooldowns.m_1 * 1000).toISOString() : null,
+    },
+    {
+      id: "m_2",
+      name: "box2",
+      state: machineState.m_2,
+      autoSuspendedAt: autoPaused.has("m_2") ? "2026-11-03T01:00:00Z" : null,
+      cooldownUntil: cooldowns.m_2 ? new Date(Date.now() + cooldowns.m_2 * 1000).toISOString() : null,
+    },
   ],
   ibk_second: [{ id: "m_3", name: "box3", state: machineState.m_3 }],
 });
 let calls = [];
 let hooks = [];
+const tgCalls = [];
 let leaseFailures = 0;
 let leaseConflicts = 0;
 let leaseRateLimits = 0;
@@ -52,6 +70,17 @@ globalThis.fetch = async (input, init = {}) => {
     return new Response("ok", { status: 200 });
   }
 
+  // Telegram Bot API：记录方法名和 body，永远回 ok（机器人只看 ok 和 description）
+  if (url.host === "api.telegram.org") {
+    const method = path.split("/").pop();
+    let body = {};
+    try {
+      body = JSON.parse(init.body || "{}");
+    } catch {}
+    tgCalls.push({ method, body, url: String(input) });
+    return Response.json({ ok: true, result: { message_id: 1 } });
+  }
+
   calls.push(method + " " + path);
 
   const own = machinesByKey()[init.headers?.["X-API-Key"]];
@@ -65,7 +94,8 @@ globalThis.fetch = async (input, init = {}) => {
 
   let m = /^\/v1\/machines\/([^/]+)$/.exec(path);
   if (m && method === "GET") {
-    const found = own.find((x) => x.id === m[1]);
+    // 官方：GET /v1/machines/{id} 按 id 或名字都行
+    const found = own.find((x) => x.id === m[1] || x.name === m[1]);
     if (!found) return new Response(JSON.stringify({ error: "not_found" }), { status: 404 });
     return Response.json(found);
   }
@@ -102,10 +132,41 @@ globalThis.fetch = async (input, init = {}) => {
     if (method === "DELETE") return new Response(null, { status: 204 });
   }
 
-  m = /^\/v1\/machines\/([^/]+)\/(resume|start|stop)$/.exec(path);
+  m = /^\/v1\/machines\/([^/]+)\/(resume|start|stop|suspend|pause|wake)$/.exec(path);
   if (m && method === "POST") {
-    machineState[m[1]] = "running";
-    return new Response(null, { status: 202 });
+    const type = m[2];
+    const cur = own.find((x) => x.id === m[1]);
+    // 冷却中：官方说任何唤醒方式都会被拒，带 retryAfterSeconds
+    if (cooldowns[m[1]] && type !== "stop" && type !== "suspend" && type !== "pause") {
+      return new Response(
+        JSON.stringify({ error: { code: "machine_cooldown", retryable: true, retryAfterSeconds: cooldowns[m[1]] } }),
+        { status: 409, headers: { "Retry-After": String(cooldowns[m[1]]) } },
+      );
+    }
+    if (type === "wake") {
+      // /wake 只认「自己空闲挂起的」机器，手动 suspend 的它不管
+      if (cur && cur.state === "suspended" && cur.autoSuspendedAt) {
+        machineState[m[1]] = "running";
+        return Response.json({ ...cur, state: "running" }); // 200 + machine
+      }
+      return new Response(JSON.stringify({ error: { code: "machine_not_running", retryable: false } }), { status: 409 });
+    }
+    machineState[m[1]] = type === "stop" ? "stopped" : type === "suspend" || type === "pause" ? "suspended" : "running";
+    // 生命周期调用一律 202 + operation（官方契约）
+    return Response.json({ id: "op_" + m[1] + "_" + type, machineId: m[1], type, state: "queued", error: null }, { status: 202 });
+  }
+
+  // 操作长轮询：?wait=25s 会挂到有变化为止，这里直接回 succeeded
+  m = /^\/v1\/operations\/([^/]+)$/.exec(path);
+  if (m && method === "GET") {
+    return Response.json({
+      id: m[1],
+      machineId: "m_x",
+      type: "resume",
+      state: "succeeded",
+      error: null,
+      machine: {},
+    });
   }
 
   return new Response(JSON.stringify({ error: "not_found " + path }), { status: 404 });
@@ -811,8 +872,9 @@ let snapshot;
   machineState.m_1 = "running";
   machineState.m_2 = "suspended";
   const before = calls.length;
-  // 预算 10：列机器 1 + m_1 续租 1 + m_2 续租 409 1 → 只剩 7，不够一次唤醒（10）
-  const tight = { ...env, INSTABOX_MACHINE: "", SUBREQUEST_LIMIT: "10", CONFIG: fakeKV(), LOG: fakeKV() };
+  // 预算 10（SUBREQUEST_LIMIT 的下限）：用名字点名两台机器要 2 次 GET（用 m_ id 会走
+  // 本地短路，不花请求），加两次续租一共 4，剩 6 —— 不够一次完整唤醒（WAKE_COST = 8）。
+  const tight = { ...env, INSTABOX_MACHINE: "qqq,box2", SUBREQUEST_LIMIT: "10", CONFIG: fakeKV(), LOG: fakeKV() };
   const out = await (await worker.fetch(post("/api/renew", {}, auth), tight)).json();
   const made = calls.slice(before);
   assert.ok(
@@ -823,6 +885,97 @@ let snapshot;
   assert.equal(m2.ok, false);
   assert.match(m2.error, /预算/, "结果里要说清是预算不够，而不是笼统失败");
   ok("唤醒前先看子请求预算，不够就不开这个头");
+}
+
+// 官方文档（docs/idle-suspend）把「唤醒」分成两条路：
+//   自己空闲挂起的（autoSuspendedAt 有值）→ POST /wake，服务端替我们等最多 45 秒
+//   你手动 suspend 的                     → /wake 不管用，必须 /resume
+// 以前一律 resume 再 start 兜底，既多打一次没用的请求，也要自己 sleep 轮询六次。
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_1 = "running";
+  machineState.m_2 = "suspended";
+  autoPaused.add("m_2");
+  const before = calls.length;
+  await worker.scheduled({}, e);
+  const made = calls.slice(before);
+  assert.ok(made.includes("POST /v1/machines/m_2/wake"), "自己挂起的机器要走官方 /wake");
+  assert.ok(!made.some((c) => c.includes("/m_2/resume")), "走了 /wake 就不该再 resume");
+  assert.equal(machineState.m_2, "running");
+  autoPaused.delete("m_2");
+  ok("空闲挂起的机器走 /wake（一次请求顶六次轮询）");
+}
+
+// 手动 suspend 的机器 /wake 不认，得 resume；而且 resume 返回的是 operation，
+// 必须等它 succeeded 再续租，不能靠猜状态。
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  autoPaused.delete("m_2");
+  machineState.m_2 = "suspended";
+  const before = calls.length;
+  await worker.scheduled({}, e);
+  const made = calls.slice(before);
+  assert.ok(made.includes("POST /v1/machines/m_2/resume"), "手动挂起的要用 resume");
+  assert.ok(!made.some((c) => c.includes("/m_2/wake")), "手动挂起的机器不该走 /wake");
+  assert.ok(
+    made.some((c) => c.startsWith("GET /v1/operations/")),
+    "生命周期调用返回 operation，要等它跑完再续租",
+  );
+  assert.equal(machineState.m_2, "running");
+  ok("手动挂起的机器走 resume，并等 operation 完成");
+}
+
+// machine_cooldown：平台让机器休息（max-run 到点 / 安全审查锁住），官方给的是分钟级。
+// 在请求内重试毫无意义 —— 以前会白扔两次请求还是失败，现在直接上报冷却时长。
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_2 = "suspended";
+  cooldowns.m_2 = 300;
+  const before = calls.length;
+  const out = await (await worker.fetch(post("/api/renew", {}, auth), e)).json();
+  const made = calls.slice(before);
+  const m2 = out.machines.find((m) => m.id === "m_2");
+  assert.equal(m2.cooling, 300, "结果里要带冷却剩余秒数");
+  assert.match(m2.error, /冷却/);
+  assert.equal(
+    made.filter((c) => c.startsWith("POST /v1/machines/m_2/")).length,
+    1,
+    "冷却不该在请求内重试（白花子请求）",
+  );
+  delete cooldowns.m_2;
+  ok("machine_cooldown 不再盲重试，改成上报冷却时长");
+}
+
+// 冷却不是故障：只有冷却、没有别的失败时不该发告警 ——
+// 否则免费版每天跑满 8 小时后会连着几小时每 30 分钟弹一条。
+{
+  machineState.m_2 = "suspended";
+  cooldowns.m_2 = 600;
+  hooks.length = 0;
+  const e = {
+    ...env,
+    INSTABOX_MACHINE: "",
+    ALERT_WEBHOOK: "https://hook.test/alert",
+    CONFIG: fakeKV(),
+    LOG: fakeKV(),
+  };
+  await worker.scheduled({}, e);
+  assert.equal(hooks.length, 0, "冷却期间不该报警");
+  delete cooldowns.m_2;
+  ok("冷却期间不告警（不把平台限制当故障）");
+}
+
+// /status 顺手带上 cooldownUntil / maxRunMinutes，排查「为什么叫不醒」时能一眼看到
+{
+  machineState.m_2 = "suspended";
+  cooldowns.m_2 = 900;
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  const out = await (await worker.fetch(req("/status", { headers: auth }), e)).json();
+  const m2 = out.machines.find((m) => m.id === "m_2");
+  assert.ok(m2.cooldownUntil, "/status 要带 cooldownUntil");
+  assert.equal(m2.autoSuspendedAt, null, "手动挂起的不该有 autoSuspendedAt");
+  delete cooldowns.m_2;
+  ok("/status 带 cooldownUntil，看得出是不是在冷却");
 }
 
 // 账号记录（KV auth）在 isolate 内缓存 60 秒：每个请求都读一次太浪费，
@@ -872,6 +1025,516 @@ let snapshot;
   assert.equal(puts, 2);
   assert.ok(ms >= 40, "应该等过 retryAfterSeconds（50ms），而不是立刻重试");
   ok("429 按 retryAfterSeconds 等待后再重试");
+}
+
+// ---- 保活区间 ----------------------------------------------------------------
+// 区间按北京时间算，测试里不能改系统时钟，就反过来构造一个「包含/不包含现在」的窗口。
+const bjNowMin = () => {
+  const d = new Date();
+  return (((d.getUTCHours() * 60 + d.getUTCMinutes() + 480) % 1440) + 1440) % 1440;
+};
+
+// 从现在起 2 小时后的一小时窗口：现在一定在外面（跨午夜就挪到 2 小时前）
+function windowExcludingNow() {
+  const m = bjNowMin();
+  let s = (m + 120) % 1440;
+  let e = (m + 180) % 1440;
+  if (s > e) {
+    s = (m - 180 + 1440) % 1440;
+    e = (m - 120 + 1440) % 1440;
+  }
+  return { start: s, end: e };
+}
+
+// 现在前后各 30 分钟：现在一定在里面（允许跨午夜）
+function windowIncludingNow() {
+  const m = bjNowMin();
+  return { start: (m - 30 + 1440) % 1440, end: (m + 30) % 1440 };
+}
+
+const winConf = (win) => JSON.stringify({ v: 1, paused: false, window: win, accounts: {} });
+
+// 区间外：cron 不续租，并且把运行状态记成 idle
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_1 = "running";
+  machineState.m_2 = "running";
+  const w = windowExcludingNow();
+  e.CONFIG._map.set("config", winConf({ on: true, ...w, maxMin: 0 }));
+  const before = calls.length;
+  const out = await worker.scheduled({}, e);
+  const made = calls.slice(before);
+  assert.ok(!made.some((c) => c.startsWith("PUT /v1/machines/")), "区间外不该续租");
+  assert.equal(JSON.parse(e.CONFIG._map.get("win")).phase, "idle");
+  ok("保活区间外不续租，状态记为 idle");
+}
+
+// 从「保活中」滑出区间：主动放一次租约，之后不再重复放
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_1 = "running";
+  machineState.m_2 = "running";
+  const w = windowExcludingNow();
+  e.CONFIG._map.set("config", winConf({ on: true, ...w, maxMin: 0 }));
+  e.CONFIG._map.set("win", JSON.stringify({ phase: "keep", startedAt: new Date().toISOString() }));
+  const before = calls.length;
+  await worker.scheduled({}, e);
+  assert.ok(
+    calls.slice(before).some((c) => c.startsWith("DELETE /v1/machines/") && c.includes("activity-leases")),
+    "刚出区间要主动放租约，别让机器干等 TTL 过期",
+  );
+  const before2 = calls.length;
+  await worker.scheduled({}, e);
+  assert.ok(
+    !calls.slice(before2).some((c) => c.includes("activity-leases")),
+    "第二轮不该再重复放租约（白花请求）",
+  );
+  ok("滑出区间时放一次租约，之后不重复");
+}
+
+// 区间内：照常续租
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_1 = "running";
+  machineState.m_2 = "running";
+  const w = windowIncludingNow();
+  e.CONFIG._map.set("config", winConf({ on: true, ...w, maxMin: 0 }));
+  const before = calls.length;
+  await worker.scheduled({}, e);
+  const leased = calls.slice(before).filter((c) => c.startsWith("PUT /v1/machines/"));
+  assert.equal(leased.length, 2, "区间内两台都要续租");
+  assert.equal(JSON.parse(e.CONFIG._map.get("win")).phase, "keep");
+  ok("保活区间内照常续租");
+}
+
+// 单次上限：全天保活 + 上限 30 分钟，startedAt 已经是 40 分钟前 → 触顶
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_1 = "running";
+  machineState.m_2 = "running";
+  e.CONFIG._map.set("config", winConf({ on: false, start: 0, end: 0, maxMin: 30 }));
+  e.CONFIG._map.set(
+    "win",
+    JSON.stringify({ phase: "keep", startedAt: new Date(Date.now() - 40 * 60000).toISOString() }),
+  );
+  const before = calls.length;
+  await worker.scheduled({}, e);
+  assert.ok(!calls.slice(before).some((c) => c.startsWith("PUT /v1/machines/")), "到上限了不该再续租");
+  assert.equal(JSON.parse(e.CONFIG._map.get("win")).phase, "capped");
+  ok("单次保活上限到点就停（capped）");
+}
+
+// 上限没到：继续保活
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_1 = "running";
+  machineState.m_2 = "running";
+  e.CONFIG._map.set("config", winConf({ on: false, start: 0, end: 0, maxMin: 120 }));
+  e.CONFIG._map.set(
+    "win",
+    JSON.stringify({ phase: "keep", startedAt: new Date(Date.now() - 10 * 60000).toISOString() }),
+  );
+  const before = calls.length;
+  await worker.scheduled({}, e);
+  assert.equal(
+    calls.slice(before).filter((c) => c.startsWith("PUT /v1/machines/")).length,
+    2,
+    "上限没到要继续续租",
+  );
+  ok("单次上限没到，照常续租");
+}
+
+// 手动触发不受区间限制（人就在旁边按的）
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_1 = "running";
+  machineState.m_2 = "running";
+  const w = windowExcludingNow();
+  e.CONFIG._map.set("config", winConf({ on: true, ...w, maxMin: 0 }));
+  const before = calls.length;
+  const out = await (await worker.fetch(post("/api/renew", {}, auth), e)).json();
+  assert.ok(out.ok);
+  assert.ok(
+    calls.slice(before).some((c) => c.startsWith("PUT /v1/machines/")),
+    "手动续租不该被区间挡住",
+  );
+  ok("手动「全部续租」不受保活区间限制");
+}
+
+// /api/config 能改区间，并且会清掉旧的运行状态（否则新上限会立刻触顶）
+{
+  const e = { ...env, CONFIG: fakeKV(), LOG: fakeKV() };
+  e.CONFIG._map.set("win", JSON.stringify({ phase: "keep", startedAt: "2026-01-01T00:00:00Z" }));
+  const res = await worker.fetch(
+    post("/api/config", { window: { on: true, start: 540, end: 1080, maxMin: 120 } }, auth),
+    e,
+  );
+  assert.equal(res.status, 200);
+  const conf = JSON.parse(e.CONFIG._map.get("config"));
+  assert.deepEqual(conf.window, { on: true, start: 540, end: 1080, maxMin: 120 });
+  assert.equal(e.CONFIG._map.get("win"), undefined, "改区间要清掉旧的 startedAt");
+  ok("/api/config 能改保活区间，并清掉旧计时");
+}
+
+// /api/state 把区间状态给面板
+{
+  const e = { ...env, CONFIG: fakeKV(), LOG: fakeKV() };
+  e.CONFIG._map.set("config", winConf({ on: true, ...windowExcludingNow(), maxMin: 60 }));
+  const out = await (await worker.fetch(req("/api/state", { headers: auth }), e)).json();
+  assert.equal(out.window.on, true);
+  assert.equal(out.window.maxMin, 60);
+  assert.equal(out.window.phase, "idle");
+  assert.match(out.window.nowAt, /^\d{2}:\d{2}$/);
+  ok("/api/state 带保活区间状态（面板要用）");
+}
+
+
+// ---- Telegram 机器人 --------------------------------------------------------
+// 重点不是命令回得漂亮，而是两件事：
+//   1. 没凭据的人推 update 进来（伪造 webhook）必须被挡住
+//   2. 机器人关掉的机器，cron 真的不再续租 —— 否则「关」这个动作是假的
+const tgEnv = (over = {}) => ({
+  ...env,
+  TELEGRAM_BOT_TOKEN: "123:abc",
+  TELEGRAM_WEBHOOK_SECRET: "s3cret",
+  TELEGRAM_CHAT_ID: "42",
+  LOG: fakeKV(),
+  CONFIG: fakeKV(),
+  ...over,
+});
+
+const tgPost = (body, headers = {}) =>
+  post("/tg/s3cret", body, { "x-telegram-bot-api-secret-token": "s3cret", ...headers });
+
+const msgUpdate = (text, chatId = 42) => ({
+  update_id: 1,
+  message: { message_id: 9, from: { id: chatId, is_bot: false }, chat: { id: chatId }, text },
+});
+
+const cbUpdate = (data, chatId = 42) => ({
+  update_id: 2,
+  callback_query: {
+    id: "cb-1",
+    from: { id: chatId },
+    data,
+    message: { message_id: 9, chat: { id: chatId } },
+  },
+});
+
+const lastTg = () => tgCalls[tgCalls.length - 1];
+const sentText = () => (lastTg()?.body?.text || "");
+
+// 1. webhook 凭据：路径错、头缺失、头不对都要 403
+{
+  const e = tgEnv();
+  const wrongPath = await worker.fetch(post("/tg/wrong", msgUpdate("/ls")), e);
+  assert.equal(wrongPath.status, 403);
+  const noHeader = await worker.fetch(post("/tg/s3cret", msgUpdate("/ls")), e);
+  assert.equal(noHeader.status, 403, "缺 secret_token 头必须拒绝");
+  const badHeader = await worker.fetch(tgPost(msgUpdate("/ls"), { "x-telegram-bot-api-secret-token": "nope" }), e);
+  assert.equal(badHeader.status, 403);
+  ok("Telegram webhook 路径/secret 头不对一律 403");
+}
+
+// 2. 没配 TELEGRAM_BOT_TOKEN 时不接活
+{
+  const res = await worker.fetch(tgPost(msgUpdate("/ls")), tgEnv({ TELEGRAM_BOT_TOKEN: "" }));
+  assert.equal(res.status, 503);
+  ok("没配 bot token 时 webhook 返回 503");
+}
+
+// 3. 没配白名单：只回显 chat id，不碰任何机器
+{
+  const e = tgEnv({ TELEGRAM_CHAT_ID: "" });
+  const before = calls.length;
+  const res = await worker.fetch(tgPost(msgUpdate("/ls")), e);
+  assert.equal(res.status, 200);
+  assert.match(sentText(), /TELEGRAM_CHAT_ID/);
+  assert.match(sentText(), /42/);
+  assert.equal(calls.length, before, "没绑定时不该去调 InstaBox API");
+  ok("没配 TELEGRAM_CHAT_ID 时只回显 id，不动机器");
+}
+
+// 4. 不在白名单的 chat 被拒
+{
+  const e = tgEnv();
+  const before = calls.length;
+  await worker.fetch(tgPost(msgUpdate("/ls", 999)), e);
+  assert.match(sentText(), /没在允许名单/);
+  assert.equal(calls.length, before);
+  ok("不在白名单的 chat 被拒绝");
+}
+
+// 5. /ls 列出机器，带每台的详情按钮
+{
+  const e = tgEnv();
+  machineState.m_1 = "running";
+  machineState.m_2 = "running";
+  tgCalls.length = 0;
+  await worker.fetch(tgPost(msgUpdate("/ls")), e);
+  const call = lastTg();
+  assert.equal(call.method, "sendMessage");
+  assert.match(call.body.text, /qqq/);
+  assert.match(call.body.text, /box2/);
+  const kb = call.body.reply_markup.inline_keyboard;
+  assert.equal(kb[0][0].callback_data, "d:1:m_1");
+  assert.ok(kb[0][0].callback_data.length <= 64);
+  ok("/ls 列出机器并给出 inline 按钮");
+}
+
+// 6. /sleep：suspend + 释放租约 + 写进 CONFIG 的 skip 名单
+{
+  const e = tgEnv();
+  machineState.m_1 = "running";
+  const before = calls.length;
+  await worker.fetch(tgPost(msgUpdate("/sleep qqq")), e);
+  const done = calls.slice(before);
+  assert.ok(done.includes("POST /v1/machines/m_1/suspend"), "应该调 suspend");
+  assert.ok(
+    done.some((c) => c.startsWith("DELETE /v1/machines/m_1/activity-leases/")),
+    "应该顺手释放租约",
+  );
+  assert.equal(machineState.m_1, "suspended");
+  const conf = JSON.parse(e.CONFIG._map.get("config"));
+  assert.deepEqual(conf.accounts["1"].skip, ["m_1"], "关掉的机器要进 skip 名单");
+  assert.equal(conf.accounts["1"].mode, "all", "不该把账号改成白名单模式");
+  assert.match(sentText(), /已休眠/);
+  ok("/sleep 休眠 + 释放租约 + 写 skip 名单（不动 mode）");
+}
+
+// 7. 关键联动：skip 里的机器，cron 不再续租，同账号其它机器照旧
+{
+  const e = tgEnv();
+  machineState.m_1 = "suspended";
+  machineState.m_2 = "running";
+  e.CONFIG._map.set("config", JSON.stringify({ v: 1, paused: false, accounts: { 1: { mode: "all", skip: ["m_1"] } } }));
+  const before = calls.length;
+  await worker.scheduled({}, e);
+  const leased = calls.slice(before).filter((c) => c.startsWith("PUT /v1/machines/"));
+  assert.ok(!leased.some((c) => c.includes("m_1")), "被关掉的机器不该再被续租（否则关不掉）");
+  assert.ok(leased.some((c) => c.includes("m_2")), "同账号其它机器照常续租");
+  ok("skip 名单里的机器 cron 不再续租，其它机器不受影响");
+}
+
+// 8. /wake：resume + 摘掉 skip + 续租
+{
+  const e = tgEnv();
+  machineState.m_1 = "suspended";
+  e.CONFIG._map.set("config", JSON.stringify({ v: 1, paused: false, accounts: { 1: { mode: "all", skip: ["m_1"] } } }));
+  const before = calls.length;
+  await worker.fetch(tgPost(msgUpdate("/wake qqq")), e);
+  const done = calls.slice(before);
+  assert.ok(done.includes("POST /v1/machines/m_1/resume"), "应该调 resume");
+  assert.ok(done.some((c) => c.startsWith("PUT /v1/machines/m_1/activity-leases/")), "唤醒后要顺手续租");
+  assert.equal(machineState.m_1, "running");
+  const conf = JSON.parse(e.CONFIG._map.get("config"));
+  assert.deepEqual(conf.accounts["1"].skip, [], "唤醒后要把 skip 摘掉");
+  ok("/wake 唤醒 + 摘掉 skip + 续租");
+}
+
+// 官方：休眠中的机器不能直接 stop（会回 409）。机器人要提前说清楚两条路，
+// 而不是让用户看到一个看不懂的失败。
+{
+  const e = tgEnv();
+  machineState.m_2 = "suspended";
+  const before = calls.length;
+  await worker.fetch(tgPost(msgUpdate("/stop box2")), e);
+  assert.match(sentText(), /不允许直接关停/);
+  assert.match(sentText(), /\/wake 再 \/stop/);
+  assert.ok(!calls.slice(before).some((c) => c.includes("/m_2/stop")), "不该白打一次 stop");
+  ok("/stop 遇到休眠中的机器给指路，不白打一次 409");
+}
+
+// 冷却中的机器叫不醒，回执要说明白「还要多久」，别让人反复点
+{
+  const e = tgEnv();
+  machineState.m_2 = "suspended";
+  cooldowns.m_2 = 600;
+  await worker.fetch(tgPost(msgUpdate("/wake box2")), e);
+  assert.match(sentText(), /冷却/);
+  assert.match(sentText(), /10 分钟/);
+  delete cooldowns.m_2;
+  ok("/wake 遇到冷却回执带剩余时间");
+}
+
+// 9. 回调按钮走通：点机器看详情 → 点休眠
+{
+  const e = tgEnv();
+  machineState.m_1 = "running";
+  tgCalls.length = 0;
+  await worker.fetch(tgPost(cbUpdate("d:1:m_1")), e);
+  assert.equal(lastTg().method, "editMessageText");
+  assert.match(lastTg().body.text, /m_1/);
+  assert.ok(lastTg().body.reply_markup.inline_keyboard[0][1].callback_data.startsWith("a:sleep:1:m_1"));
+
+  const before = calls.length;
+  await worker.fetch(tgPost(cbUpdate("a:sleep:1:m_1")), e);
+  assert.ok(calls.slice(before).includes("POST /v1/machines/m_1/suspend"));
+  assert.equal(machineState.m_1, "suspended");
+  const methods = tgCalls.map((c) => c.method);
+  assert.ok(methods.includes("answerCallbackQuery"), "回调必须先应答，不然按钮一直转圈");
+  ok("回调按钮：详情 → 休眠 全链路走通");
+}
+
+// 10. /pause on 写全局暂停
+{
+  const e = tgEnv();
+  await worker.fetch(tgPost(msgUpdate("/pause on")), e);
+  assert.equal(JSON.parse(e.CONFIG._map.get("config")).paused, true);
+  ok("/pause on 全局暂停保活");
+}
+
+// 11. 注册 webhook：带上 secret_token，且 /api/telegram 需要凭据
+{
+  const e = tgEnv();
+  const noAuth = await worker.fetch(req("/api/telegram?action=set"), e);
+  assert.equal(noAuth.status, 401);
+  tgCalls.length = 0;
+  const res = await worker.fetch(req("/api/telegram?action=set", { headers: auth }), e);
+  assert.equal(res.status, 200);
+  const set = tgCalls.find((c) => c.method === "setWebhook");
+  assert.ok(set, "应该调用 setWebhook");
+  assert.equal(set.body.url, "https://worker.test/tg/s3cret");
+  assert.equal(set.body.secret_token, "s3cret");
+  ok("/api/telegram?action=set 注册 webhook（带 secret_token，且需凭据）");
+}
+
+// 12. 网页里配 bot：存进 CONFIG，接口只回打码值
+//     故意不给任何 TELEGRAM_* 环境变量 —— 这条路径要能完全靠面板跑通
+{
+  const e = { ...env, LOG: fakeKV(), CONFIG: fakeKV() };
+  e.CONFIG._map.set("config", JSON.stringify({ v: 1, paused: false, accounts: {} }));
+
+  const noAuth = await worker.fetch(
+    post("/api/telegram", { telegram: { token: "999123456:AAH_kv_token_for_test_only" } }),
+    e,
+  );
+  assert.equal(noAuth.status, 401, "写接口没凭据必须挡住");
+
+  const saved = await worker.fetch(
+    post("/api/telegram", { telegram: { token: "999123456:AAH_kv_token_for_test_only", secret: "kvsecret", chats: "42,43" } }, auth),
+    e,
+  );
+  assert.equal(saved.status, 200);
+  const sb = await saved.json();
+  assert.equal(sb.ok, true);
+  assert.equal(sb.telegram.configured, true);
+  assert.equal(sb.telegram.src.token, "kv");
+  assert.deepEqual(sb.telegram.chats, ["42", "43"]);
+
+  const st = await (await worker.fetch(req("/api/state", { headers: auth }), e)).json();
+  assert.equal(st.telegram.configured, true);
+  assert.ok(st.telegram.tokenMasked.startsWith("9991"), "打码要保留前 4 位好认");
+  assert.equal(st.telegram.tokenMasked.includes("AAH_kv"), false, "明文 token 不能出现在接口响应里");
+  assert.equal(st.telegram.secretMasked.includes("kvsecret"), false, "明文 secret 不能出现在接口响应里");
+  assert.deepEqual(st.telegram.chats, ["42", "43"]);
+  ok("网页里配的 token 存进 CONFIG，/api/state 只回打码值");
+}
+
+// 13. 存完之后立刻生效：注册用 KV 的 token + secret，不是环境变量那套
+{
+  const e = { ...env, LOG: fakeKV(), CONFIG: fakeKV() };
+  e.CONFIG._map.set("config", JSON.stringify({ v: 1, paused: false, accounts: {} }));
+  await worker.fetch(
+    post("/api/telegram", { telegram: { token: "999123456:AAH_kv_token_for_test_only", secret: "kvsecret" } }, auth),
+    e,
+  );
+  tgCalls.length = 0;
+  const res = await worker.fetch(
+    post("/api/telegram", { register: true }, auth),
+    e,
+  );
+  assert.equal(res.status, 200);
+  const set = tgCalls.find((c) => c.method === "setWebhook");
+  assert.ok(set, "应该调用 setWebhook");
+  assert.ok(set.url.includes("/bot999123456:AAH_kv_token_for_test_only/setWebhook"), "要用 KV 里的 token：" + set.url);
+  assert.equal(set.body.url, "https://worker.test/tg/kvsecret");
+  assert.equal(set.body.secret_token, "kvsecret");
+  const menu = tgCalls.find((c) => c.method === "setMyCommands");
+  assert.ok(menu, "顺带要把命令菜单注册上");
+  ok("保存后立刻生效：webhook 用 KV 的 token/secret，并注册命令菜单");
+}
+
+// 14. 面板配的 secret 真的参与 webhook 校验（不是只写进 KV 好看）
+{
+  const e = { ...env, LOG: fakeKV(), CONFIG: fakeKV() };
+  e.CONFIG._map.set("config", JSON.stringify({ v: 1, paused: false, accounts: {} }));
+  await worker.fetch(
+    post("/api/telegram", { telegram: { token: "999123456:AAH_kv_token_for_test_only", secret: "kvsecret", chats: "42" } }, auth),
+    e,
+  );
+  const good = await worker.fetch(
+    req("/tg/kvsecret", {
+      method: "POST",
+      headers: { "x-telegram-bot-api-secret-token": "kvsecret", "content-type": "application/json" },
+      body: JSON.stringify(msgUpdate("/help")),
+    }),
+    e,
+  );
+  assert.equal(good.status, 200);
+  // 环境变量里那个 s3cret 这时候已经不该认了
+  const bad = await worker.fetch(
+    req("/tg/s3cret", {
+      method: "POST",
+      headers: { "x-telegram-bot-api-secret-token": "s3cret", "content-type": "application/json" },
+      body: JSON.stringify(msgUpdate("/help")),
+    }),
+    e,
+  );
+  assert.equal(bad.status, 403);
+  ok("面板配的 secret 真的参与 webhook 校验");
+}
+
+// 15. 清空 = 回退环境变量，不是把机器人搞挂
+{
+  const e = tgEnv();
+  e.CONFIG._map.set("config", JSON.stringify({ v: 1, paused: false, accounts: {} }));
+  await worker.fetch(
+    post("/api/telegram", { telegram: { token: "999123456:AAH_kv_token_for_test_only", secret: "kvsecret" } }, auth),
+    e,
+  );
+  const cleared = await worker.fetch(
+    post("/api/telegram", { telegram: null }, auth),
+    e,
+  );
+  assert.equal(cleared.status, 200);
+  const st = await (await worker.fetch(req("/api/state", { headers: auth }), e)).json();
+  assert.equal(st.telegram.src.token, "env", "清空后要回到环境变量");
+  assert.equal(st.telegram.configured, true, "清空不等于没配：环境变量里还有");
+  assert.equal(st.telegram.src.secret, "env");
+  ok("清空网页配置后回退环境变量");
+}
+
+// 16. 只填 token 不填 secret：面板自动补一个，别让 /tg 变成谁都能打的公开接口
+//     不补的话，任何人 POST /tg 一个伪造 update 就能关机（chat id 是请求体里写的）
+{
+  const e = { ...env, LOG: fakeKV(), CONFIG: fakeKV() };
+  e.CONFIG._map.set("config", JSON.stringify({ v: 1, paused: false, accounts: {} }));
+  tgCalls.length = 0;
+  const r = await worker.fetch(
+    post("/api/telegram", { telegram: { token: "8123456789:AAH_nosecret", chats: "42" }, register: true }, auth),
+    e,
+  );
+  assert.equal(r.status, 200);
+  const j = await r.json();
+  assert.equal(j.secretGenerated, true, "应该自动生成 secret");
+  const set = tgCalls.find((c) => c.method === "setWebhook");
+  assert.ok(/^[0-9a-f]{32}$/.test(set.body.secret_token || ""), "setWebhook 要带上自动生成的 secret_token");
+  assert.ok(set.body.url.includes(set.body.secret_token), "URL 里也要有同一串");
+
+  // 裸 /tg 现在必须打不进来
+  tgCalls.length = 0;
+  const forged = await worker.fetch(
+    req("/tg", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ update_id: 9, message: { message_id: 9, chat: { id: 42 }, from: { id: 42, is_bot: false }, text: "/stop qqq" } }),
+    }),
+    e,
+  );
+  assert.equal(forged.status, 403, "没有 secret 串就不该接受 update");
+  assert.equal(tgCalls.length, 0, "更不能真的去动机器");
+  ok("没填 secret 时自动生成，裸 /tg 打不进来");
 }
 
 console.log("\n" + passed + " 项通过");

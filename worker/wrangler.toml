@@ -23,7 +23,8 @@ INSTABOX_LEASE_TTL = "900"
 INSTABOX_LOG_MODE = "hourly"
 # 机器被挂起/停掉后续租会 409 machine_not_running：默认先 resume（stopped 用 start 兜底）再续租，设 0 关掉
 INSTABOX_AUTO_RESUME = "1"
-# 唤醒后等机器变 running 的窗口：次数 × 间隔秒（默认 6×5 = 30 秒，机器启动慢就再放宽）
+# 等唤醒完成的总窗口 = 次数 × 间隔秒（默认 6×5 = 30 秒，机器启动慢就再放宽）。
+# 实际靠 GET /v1/operations/{id}?wait=25s 长轮询消耗，不再自己 sleep 轮询。
 WAKE_TRIES = "6"
 WAKE_GAP = "5"
 # 失败告警：webhook 地址里通常带密钥，用 `npx wrangler secret put ALERT_WEBHOOK` 存，别写在这里
@@ -48,9 +49,23 @@ ALERT_MIN_INTERVAL = "1800"
 # 改过之后 ADMIN_PASSWORD 就不生效了；想退回环境变量就删掉 KV 里的 auth 键。
 # AUTH_ITER 可调 PBKDF2 迭代次数（默认 50000，付费版可以调高）。
 
+# Telegram 机器人（可选，手机开关机器；见 docs/TELEGRAM.md）：
+#   TELEGRAM_BOT_TOKEN       Secret，@BotFather 拿的 token
+#   TELEGRAM_CHAT_ID         允许操作的 chat id，逗号分隔多个；留空则只回显 id 不执行操作
+#   TELEGRAM_WEBHOOK_SECRET  Secret，webhook 路径里的随机串 + Telegram 的 secret_token 头
+# 三个都可以不配 —— 网页面板里有「Telegram 机器人」卡片，填完点「保存并注册」即可，
+# 值会存进 CONFIG KV 的 telegram 键，优先于这里的环境变量（留空 = 跟随变量）。
+# 用环境变量这条路的话：npx wrangler secret put TELEGRAM_BOT_TOKEN 这类命令存，别写进本文件；
+# 配好后注册 webhook：GET /api/telegram?action=set&token=<TOKEN>
+# TELEGRAM_CHAT_ID 是普通变量，可以直接写在这里，但它属于「谁能操作你的机器」，
+# 建议也用 secret put 存，免得仓库里泄露你的 chat id。
+
 # KV 绑定（可选，两个都能用同一个 namespace，也可以各建一个）：
 #   LOG     保活日志，/log 和面板的「最近日志」用它
-#   CONFIG  面板的开关（每台机器保不保活、账号开关、全局暂停）+ 最近一次续租时间
+#   CONFIG  面板的开关（每台机器保不保活、账号开关、全局暂停、保活区间）+ 最近一次续租时间
+#           保活区间不需要新环境变量：时段和单次上限都存在 CONFIG 的 config 键里，
+#           运行态（keep / idle / capped、本轮起算时间）在同 KV 的 win 键。
+#           没绑 CONFIG 就只能在环境变量层面跑，面板的区间卡片会禁用。
 # 建法：dashboard → Storage & Databases → KV → Create namespace → 复制 id 填到下面
 # 都不绑也能跑，只是 /log 空、面板变成只读（能看能手动续租，开关存不下来）
 #

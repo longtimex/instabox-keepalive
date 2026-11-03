@@ -73,7 +73,7 @@ code{background:var(--code);padding:1px 5px;border-radius:4px;font-size:12.5px}
 
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;margin-bottom:16px;overflow:hidden}
 .panel-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:13px 16px;border-bottom:1px solid var(--line)}
-.panel-head h2{font-size:13.5px;font-weight:500;margin:0}
+.panel-head h2{font-size:13.5px;font-weight:500;margin:0;white-space:nowrap}
 .head-actions{display:flex;gap:6px;align-items:center}
 .hint{font-size:12px;color:var(--muted)}
 .table-wrap{overflow-x:auto}
@@ -94,6 +94,19 @@ td .btn+.btn{margin-left:6px}
 .left.muted{color:var(--muted)}
 .c-bad{color:var(--bad)}
 .c-warn{color:var(--warn)}
+
+/* 保活区间 */
+.wbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 10px;padding:14px 16px 2px}
+/* 时间/上限各包一组，窄屏换行时整组走，不会把「08:00 至 23:00」拆成两半 */
+.wgrp{display:flex;align-items:center;gap:6px;white-space:nowrap}
+.wbar input[type=time],.wbar input[type=number],.wbar input[type=text],.wbar input[type=password]{font:inherit;font-size:13px;padding:5px 8px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text)}
+.wbar input[type=time]{width:104px}
+.wbar input[type=number]{width:76px}
+.wbar input[type=text]{width:210px}
+.wbar input[type=password]{width:250px}
+.wbar .wtag{font-size:13px}
+.wstate{padding:8px 16px 14px;font-size:12.5px;color:var(--muted)}
+.wstate.warn{color:var(--warn)}
 
 .sw{position:relative;display:inline-block;width:38px;height:22px;vertical-align:middle}
 .sw input{position:absolute;left:0;top:0;width:100%;height:100%;margin:0;opacity:0;cursor:pointer;z-index:1}
@@ -150,6 +163,14 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
   .stats{grid-template-columns:repeat(2,1fr)}
   .wrap{padding:16px 12px 50px}
   .stat b{font-size:19px}
+  /* 手机屏别把列挤成一行两三个字，撑开让 .table-wrap 横向滚动 */
+  table{min-width:600px}
+  /* 输入框 + 右侧按钮是一组不换行的，得让输入框先让位，否则按钮被挤出视口 */
+  .wbar input[type=password]{width:150px}
+  .wbar input[type=text]{width:140px}
+  .wbar{gap:8px}
+  /* 标题别被 hint 挤成两行 */
+  .panel-head{flex-wrap:wrap;gap:4px 12px}
 }
 </style>
 </head>
@@ -177,6 +198,33 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
 
     <section class="panel">
       <div class="panel-head">
+        <h2>保活区间</h2>
+        <span class="hint" id="whint">按北京时间</span>
+      </div>
+      <div class="wbar">
+        <span class="wgrp">
+          <label class="sw" title="只在这段时间里续租">
+            <input type="checkbox" id="w-on"><i></i>
+          </label>
+          <span class="wtag">只在时间段内保活</span>
+        </span>
+        <span class="wgrp">
+          <input type="time" id="w-start" value="08:00" step="60">
+          <span class="muted">至</span>
+          <input type="time" id="w-end" value="23:00" step="60">
+        </span>
+        <span class="wgrp">
+          <span class="muted">单次上限</span>
+          <input type="number" id="w-max" min="0" max="1440" step="15" value="0">
+          <span class="muted">分钟（0 = 不限）</span>
+        </span>
+        <button class="btn tiny primary" id="b-wsave" type="button">保存</button>
+      </div>
+      <div class="wstate" id="wstate"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
         <h2>机器</h2>
         <span class="hint" id="mhint"></span>
       </div>
@@ -200,6 +248,34 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
         <span class="hint">开关只影响续租，不改机器本身</span>
       </div>
       <div id="accts" class="accts"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Telegram 机器人</h2>
+        <span class="hint">手机上开关机器；token / secret 留空表示不改</span>
+      </div>
+      <div class="wbar">
+        <span class="wgrp">
+          <span class="muted">Bot token</span>
+          <input type="password" id="tg-token" autocomplete="off" spellcheck="false">
+        </span>
+        <span class="wgrp">
+          <span class="muted">Webhook secret</span>
+          <input type="password" id="tg-secret" autocomplete="off" spellcheck="false">
+          <button class="btn tiny" id="b-tggen" type="button">随机生成</button>
+        </span>
+      </div>
+      <div class="wbar">
+        <span class="wgrp">
+          <span class="muted">允许的 chat id</span>
+          <input type="text" id="tg-chats" placeholder="逗号分隔；留空 = 只回显 id 不执行" autocomplete="off">
+        </span>
+        <button class="btn tiny primary" id="b-tgsave" type="button">保存并注册</button>
+        <button class="btn tiny" id="b-tginfo" type="button">查看状态</button>
+        <button class="btn tiny danger" id="b-tgclear" type="button">清空</button>
+      </div>
+      <div class="wstate" id="tg-state"></div>
     </section>
 
     <section class="panel">
@@ -392,6 +468,11 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
       var st = m.state || "unknown";
       var stCls = st === "running" ? "ok" : (st === "suspended" || st === "stopped" ? "warn" : "");
       var r = leftInfo(m.expiresAt);
+      // 冷却中：这时候点「唤醒」一定会被平台拒（409 machine_cooldown），先标出来
+      var cooling = m.cooldownUntil && new Date(m.cooldownUntil).getTime() > Date.now();
+      var cool = cooling
+        ? '<div class="mid muted">冷却中，还剩 ' + esc(leftInfo(m.cooldownUntil).text.replace("后到期", "")) + "</div>"
+        : "";
       var dis = readOnly ? " disabled" : "";
       var ops = '<button class="btn tiny" data-act="renew" data-a="' + m.account + '" data-id="' + esc(m.id) + '"' + dis + ">续租</button>";
       if (st !== "running") {
@@ -402,7 +483,7 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
       html += "<tr>" +
         '<td class="mono muted">#' + esc(m.account) + "</td>" +
         '<td><div class="mname">' + esc(m.name) + '</div><div class="mid mono">' + esc(m.id) + "</div></td>" +
-        '<td><span class="badge ' + stCls + '">' + esc(st) + "</span></td>" +
+        '<td><span class="badge ' + stCls + '">' + esc(st) + "</span>" + cool + "</td>" +
         '<td><span class="left ' + r.cls + '" data-exp="' + esc(m.expiresAt || "") + '">' + esc(r.text) + "</span></td>" +
         '<td class="c"><label class="sw"><input type="checkbox" data-act="toggle" data-a="' + m.account +
           '" data-id="' + esc(m.id) + '"' + (m.selected ? " checked" : "") + dis + "><i></i></label></td>" +
@@ -410,6 +491,94 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
         "</tr>";
     }
     $("mrows").innerHTML = html;
+  }
+
+  // 用户动过区间表单但还没保存时，别让 20 秒一次的自动刷新把输入覆盖掉
+  var wDirty = false;
+
+  function renderWindow() {
+    var w = data.window;
+    var el = $("wstate");
+    if (!w) { el.textContent = ""; return; }
+
+    if (!wDirty) {
+      $("w-on").checked = !!w.on;
+      $("w-start").value = w.startAt || "08:00";
+      $("w-end").value = w.endAt || "23:00";
+      $("w-max").value = w.maxMin || 0;
+    }
+
+    var dis = readOnly || !data.canSave;
+    $("w-on").disabled = dis;
+    $("w-start").disabled = dis;
+    $("w-end").disabled = dis;
+    $("w-max").disabled = dis;
+    $("b-wsave").disabled = dis;
+
+    var t = "现在北京时间 " + w.nowAt + " · ";
+    var cls = "wstate";
+    if (!w.on) {
+      t += w.maxMin ? "全天保活，单次最多 " + w.maxMin + " 分钟" : "全天保活";
+    } else if (w.phase === "idle") {
+      t += "不在区间内，cron 不续租，机器会自然休眠";
+      cls += " warn";
+    } else if (w.phase === "capped") {
+      t += "本轮已保活 " + w.keptMin + " 分钟，到 " + w.maxMin + " 分钟上限了";
+      cls += " warn";
+    } else {
+      t += "正在保活" + (w.maxMin ? "，本轮已 " + w.keptMin + "/" + w.maxMin + " 分钟" : "");
+    }
+    if (!data.canSave) t += " · 没绑 CONFIG KV，改了不会保存";
+    el.className = cls;
+    el.textContent = t;
+  }
+
+  // 机器人配置：token / secret 永远不回显，输入框留空 = 保持原值
+  var tgDirty = false;
+
+  function tgSource(s) {
+    return s === "kv" ? "网页" : s === "env" ? "环境变量" : "没配";
+  }
+
+  function renderTg() {
+    var t = data.telegram || {};
+    var el = $("tg-state");
+    var dis = readOnly || !data.canSave;
+
+    ["tg-token", "tg-secret", "tg-chats"].forEach(function (id) { $(id).disabled = dis; });
+    $("b-tggen").disabled = dis;
+    $("b-tgsave").disabled = dis;
+    $("b-tgclear").disabled = dis;
+
+    $("tg-token").placeholder = t.tokenMasked
+      ? "已配置 " + t.tokenMasked
+      : "填 BotFather 给的 token";
+    $("tg-secret").placeholder = t.secretMasked
+      ? "已配置 " + t.secretMasked
+      : "点右边「随机生成」";
+    if (!tgDirty) $("tg-chats").value = (t.chats || []).join(",");
+
+    var cls = "wstate";
+    var txt;
+    if (!t.configured) {
+      txt = "还没配 token，机器人不可用。";
+      cls += " warn";
+    } else if (!t.secretMasked) {
+      txt = "⚠️ 没配 webhook secret：/tg 谁都能打，别人知道 chat id 就能关机。点「随机生成」再保存。";
+      cls += " warn";
+    } else {
+      txt = "token 来自" + tgSource(t.src && t.src.token) +
+        " · secret 来自" + tgSource(t.src && t.src.secret) +
+        " · " + (t.chats && t.chats.length
+          ? "允许 " + t.chats.length + " 个聊天"
+          : "没限聊天，任何人发消息都只回显 id");
+    }
+    if (!data.canSave) {
+      txt += " · 没绑 CONFIG KV，网页里填的存不下来";
+      cls += " warn";
+    }
+    el.className = cls;
+    el.textContent = txt;
   }
 
   function renderAccounts() {
@@ -472,6 +641,8 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
     $("b-logclear").disabled = readOnly;
 
     renderStats();
+    renderWindow();
+    renderTg();
     renderMachines();
     renderAccounts();
     $("foot-at").textContent = "更新于 " + when(data.at) + " · v" + data.version;
@@ -599,6 +770,135 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
     var next = !(data && data.paused);
     saveConfig({ paused: next }).then(function (ok) {
       if (ok) toast(next ? "已暂停，cron 不再续租" : "已恢复保活");
+    });
+  });
+
+  // 保活区间：时间输入是 "HH:MM"，换算成当天第几分钟再发
+  function toMin(v, fallback) {
+    var m = /^(\d{1,2}):(\d{2})$/.exec(String(v || ""));
+    if (!m) return fallback;
+    var h = Number(m[1]);
+    var mi = Number(m[2]);
+    return h > 23 || mi > 59 ? fallback : h * 60 + mi;
+  }
+
+  ["w-on", "w-start", "w-end", "w-max"].forEach(function (id) {
+    var el = $(id);
+    if (!el) return;
+    el.addEventListener("input", function () { wDirty = true; });
+    el.addEventListener("change", function () { wDirty = true; });
+  });
+
+  $("b-wsave").addEventListener("click", function () {
+    var w = (data && data.window) || {};
+    var maxMin = Math.max(0, Math.min(1440, Number($("w-max").value) || 0));
+    var patch = {
+      window: {
+        on: $("w-on").checked,
+        start: toMin($("w-start").value, w.start == null ? 480 : w.start),
+        end: toMin($("w-end").value, w.end == null ? 1380 : w.end),
+        maxMin: maxMin,
+      },
+    };
+    var b = this;
+    b.disabled = true;
+    saveConfig(patch).then(function (ok) {
+      b.disabled = false;
+      if (ok) wDirty = false; // 存成功才允许后续刷新回填
+    });
+  });
+
+  // ---- Telegram 机器人 ------------------------------------------------------
+  ["tg-token", "tg-secret", "tg-chats"].forEach(function (id) {
+    var el = $(id);
+    if (!el) return;
+    el.addEventListener("input", function () { tgDirty = true; });
+    el.addEventListener("change", function () { tgDirty = true; });
+  });
+
+  $("b-tggen").addEventListener("click", function () {
+    var buf = new Uint8Array(16);
+    crypto.getRandomValues(buf);
+    var hex = "";
+    for (var i = 0; i < buf.length; i++) hex += ("0" + buf[i].toString(16)).slice(-2);
+    $("tg-secret").value = hex;
+    tgDirty = true;
+  });
+
+  // 只提交真的改过的字段：token/secret 留空 = 保持原值，chats 没变就不写
+  $("b-tgsave").addEventListener("click", function () {
+    var t = (data && data.telegram) || {};
+    var patch = {};
+    var tok = $("tg-token").value.trim();
+    var sec = $("tg-secret").value.trim();
+    if (tok) patch.token = tok;
+    if (sec) patch.secret = sec;
+    var chatsNow = $("tg-chats").value.split(/[,\s]+/).filter(Boolean).join(",");
+    if (chatsNow !== (t.chats || []).join(",")) patch.chats = chatsNow;
+    if (!Object.keys(patch).length) {
+      toast("没有改动：token/secret 留空表示不改，chat id 也没变");
+      return;
+    }
+
+    var b = this;
+    b.disabled = true;
+    b.textContent = "保存中…";
+    api("/api/telegram", { method: "POST", body: { telegram: patch, register: true } }).then(function (j) {
+      b.disabled = false;
+      b.textContent = "保存并注册";
+      if (!j.ok) { toast(j.error || "保存失败", true); return; }
+      tgDirty = false;
+      $("tg-token").value = "";
+      $("tg-secret").value = "";
+      var tail = typeof j.commands === "number" ? "，命令菜单 " + j.commands + " 条" : "";
+      toast((j.secretGenerated ? "已保存并注册（secret 自动生成）" : "已保存并注册") + tail);
+      load();
+    }).catch(function (e) {
+      b.disabled = false;
+      b.textContent = "保存并注册";
+      toast("请求失败：" + e.message, true);
+    });
+  });
+
+  $("b-tginfo").addEventListener("click", function () {
+    var el = $("tg-state");
+    el.className = "wstate";
+    el.textContent = "查询中…";
+    api("/api/telegram?action=info").then(function (j) {
+      if (!j.ok) {
+        el.className = "wstate warn";
+        el.textContent = j.error || "查询失败";
+        return;
+      }
+      var r = (j.telegram && j.telegram.result) || {};
+      var bits = [];
+      if (r.url) bits.push("webhook 已注册：" + r.url);
+      else bits.push("webhook 还没注册（点「保存并注册」）");
+      if (typeof r.pending_update_count === "number") bits.push("待处理 " + r.pending_update_count + " 条");
+      if (r.last_error_message) bits.push("最近错误：" + r.last_error_message + "（" + (r.last_error_date ? when(new Date(r.last_error_date * 1000).toISOString()) : "") + "）");
+      el.className = "wstate" + (r.last_error_message ? " warn" : "");
+      el.textContent = bits.join(" · ");
+    }).catch(function (e) {
+      el.className = "wstate warn";
+      el.textContent = "请求失败：" + e.message;
+    });
+  });
+
+  $("b-tgclear").addEventListener("click", function () {
+    if (!confirm("清掉网页里填的机器人配置，回退到环境变量（TELEGRAM_*）？")) return;
+    var b = this;
+    b.disabled = true;
+    api("/api/telegram", { method: "POST", body: { telegram: null } }).then(function (j) {
+      b.disabled = false;
+      if (!j.ok) { toast(j.error || "清空失败", true); return; }
+      tgDirty = false;
+      $("tg-token").value = "";
+      $("tg-secret").value = "";
+      toast("已清空，现在跟随环境变量");
+      load();
+    }).catch(function (e) {
+      b.disabled = false;
+      toast("请求失败：" + e.message, true);
     });
   });
 

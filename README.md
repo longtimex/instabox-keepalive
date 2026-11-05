@@ -1,6 +1,6 @@
 # instabox-keepalive
 
-[InstaBox](https://instabox.sh) 的机器空闲 30 分钟就会自动休眠（`auto-suspend`）。本仓库一个 `keepalive.sh` 搞定保活：用官方 **activity lease** 定期续租，让机器一直醒着；另有 **Cloudflare Worker** 版，不想自己找台常开机器时用；**Docker** 版给 NAS / 群晖 / 1Panel 这类容器环境。三种跑法都支持多账号（多把 key 无限叠加）和 409 自愈（被挂起自动唤醒再续租）。Worker 版还带一个**网页管理面板**（登录后进 `/ui`）：逐台开关保活、看租约到期倒计时、手动续租/唤醒/释放、翻最近日志（可一键清空），全程点鼠标；面板里还能设**保活区间**（每天几点到几点 + 单次最多保活多久，按北京时间），不想 7×24 烧免费额度就用它。另外还有个 **Telegram 机器人**，手机上就能唤醒/休眠/关机、也能改保活区间 —— 见 [docs/TELEGRAM.md](docs/TELEGRAM.md)。
+[InstaBox](https://instabox.sh) 的机器空闲 30 分钟就会自动休眠（`auto-suspend`）。本仓库一个 `keepalive.sh` 搞定保活：用官方 **activity lease** 定期续租，让机器一直醒着；另有 **Cloudflare Worker** 版，不想自己找台常开机器时用；**Docker** 版给 NAS / 群晖 / 1Panel 这类容器环境。三种跑法都支持多账号（多把 key 无限叠加）和 409 自愈（被挂起自动唤醒再续租）。Worker 版还带一个**网页管理面板**（登录后进 `/ui`）：逐台开关保活、看租约到期倒计时、手动续租/唤醒/释放、翻最近日志（可一键清空），全程点鼠标；面板里还能设**保活区间**（每天哪几个时段 + 单次最多保活多久，可设多段，按北京时间），不想 7×24 烧免费额度就用它。另外还有个 **Telegram 机器人**，手机上就能唤醒/休眠/关机、也能改保活区间 —— 见 [docs/TELEGRAM.md](docs/TELEGRAM.md)。
 
 > **为什么不能直接把休眠关掉**（`autoSuspendAfterSeconds=0`）？2026-10-18 实测：普通/邀请制账号的 `/v1/me` 里有 `"fixedAutoSuspendSeconds": 1800`、`"manualLifecycle": false`，服务端把空闲挂起阈值**锁死在账号级**，因此对 `PATCH /v1/machines/{id}` 传 `autoSuspendAfterSeconds: 0`（或任何值，含官方 `instabox auto-suspend <box> 0` 与 SDK `setAutoSuspend`）**一律被静默忽略**：返回 200，值仍是 1800。所以只能用租约这条官方口子。
 
@@ -73,7 +73,7 @@ sh /root/instabox-keepalive/keepalive.sh uninstall   # 彻底卸载（停服务�
 | `INSTABOX_LEASE` | `keepalive` | 租约名 |
 | `INSTABOX_LEASE_TTL` | `300` | 秒，30–3600；想更稳就填 `600`（见《怎么把保活成功率做到最高》） |
 | `INSTABOX_RENEW_EVERY` | `0.6 × ttl` | 续租间隔，0–86400 秒（实际最小间隔 5 秒） |
-| `INSTABOX_AUTO_RESUME` | `1` | 遇 409 先 resume（stopped 用 start 兜底）再续；`0` 只报错不唤醒 |
+| `INSTABOX_AUTO_RESUME` | `1` | 遇 409 先按状态唤醒（wake / resume / start）再续；`0` 只报错不唤醒 |
 | `INSTABOX_WAKE_GAP` / `INSTABOX_WAKE_TRIES` | `5` / `6` | 等唤醒完成的总窗口 = 两者相乘（默认 30 秒，实际收敛到 5–55 秒）。由 operation 长轮询消耗，不再自己 sleep 轮询 |
 | `INSTABOX_ALERT_WEBHOOK` | 空＝不告警 | 续租失败/恢复时 POST 一条过去 |
 | `INSTABOX_ALERT_FORMAT` | `text` | `text` / `feishu` / `dingtalk`（企业微信同款）/ `discord` |
@@ -182,7 +182,7 @@ docker compose run --rm instabox-keepalive --status
    | `INSTABOX_LEASE` | Text | `keepalive`（可选） |
    | `INSTABOX_LEASE_TTL` | Text | `900`（建议；不填默认 300，会比 cron 间隔小） |
    | `INSTABOX_LOG_MODE` | Text | `hourly`（默认）/ `every` / `off`，控制写 KV 的频次 |
-   | `INSTABOX_AUTO_RESUME` | Text | `1`（默认）。机器被平台挂起/停掉时，先 `resume`（stopped 用 `start` 兜底）再续租；设 `0` 只报错不唤醒 |
+   | `INSTABOX_AUTO_RESUME` | Text | `1`（默认）。机器被平台挂起/停掉时，先按状态唤醒（`wake` / `resume` / `start`）再续租；设 `0` 只报错不唤醒 |
    | `ALERT_WEBHOOK` | Secret | 失败告警地址，续租失败/恢复时 POST 一条（不填就只写日志） |
    | `ALERT_FORMAT` | Text | `text`（默认）/ `feishu` / `dingtalk`（企业微信同款）/ `discord` |
    | `ALERT_MIN_INTERVAL` | Text | 同一故障最多多久发一次（默认 1800 秒） |
@@ -217,7 +217,7 @@ Worker 版自带面板，浏览器打开 `https://<你的worker>.workers.dev/ui`
 
 ![网页管理面板](docs/panel.png)
 
-- **保活区间**：机器表格上方的卡片，设「每天几点到几点续租」+「单次最多保活多久」，保存即生效；卡片里直接显示当前处于哪个阶段（保活中 / 不在时段 / 已用满）。详见下面的[保活区间](#保活区间只在要用的时段烧机时)
+- **保活区间（默认 + 单机）**：机器表格上方的卡片设账号默认区间（可加多段）；机器表格的「区间」列可给每台机器单独设置，未设置的机器自动继承默认值。保存即生效，并显示当前阶段（保活中 / 不在时段 / 已用满）。详见下面的[保活区间](#保活区间只在要用的时段烧机时)
 - **机器表格**：账号、机器名、`state`、租约剩余时间（每秒倒计时）、保活开关，以及单台的「续租 / 唤醒 / 释放」；冷却中的机器会在状态下面标出剩余分钟数
 - **保活开关**：关掉某台 = 下一轮 cron 不再给它续租，租约过期后按平台规则自动休眠；开着 = 一直续。开关显示的是**实际生效**的选中态：还没保存过面板配置时，它跟着 `INSTABOX_MACHINE` 走
 - **账号卡片**：key 打码、租约名、TTL、机器数，整账号开关 + 「全部保活 / 恢复默认」
@@ -240,9 +240,24 @@ Worker 版自带面板，浏览器打开 `https://<你的worker>.workers.dev/ui`
 ```json
 {
   "paused": false,
-  "window": { "on": true, "start": 480, "end": 1380, "maxMin": 120 },
+  "window": {
+    "on": true,
+    "ranges": [
+      { "start": 540, "end": 720 },
+      { "start": 840, "end": 1080 }
+    ],
+    "maxMin": 120
+  },
   "accounts": {
-    "1": { "enabled": true, "mode": "list", "machines": ["m_abc123", "m_def456"] }
+    "1": {
+      "enabled": true,
+      "mode": "list",
+      "machines": ["m_abc123", "m_def456"],
+      "inheritSelection": false,
+      "windows": {
+        "m_abc123": { "on": true, "ranges": [{ "start": 540, "end": 1080 }], "maxMin": 90 }
+      }
+    }
   }
 }
 ```
@@ -257,24 +272,27 @@ Worker 版自带面板，浏览器打开 `https://<你的worker>.workers.dev/ui`
 
 | 维度 | 例子 | 说明 |
 | --- | --- | --- |
-| 每天的时间段 | `08:00–23:00` | 只在这个时段内续租。**固定按北京时间（UTC+8）算**，跟你人在哪、Worker 跑在哪无关 |
-| 单次最长时长 | `120` 分钟 | 从「进入时段」那一刻开始算，连续保活最多这么久，到点就停。`0` = 不限 |
+| 每天的时间段 | `09:00–12:00`、`14:00–18:00` | 只在这些时段内续租，**一台机器可以加多段**（最多 8 段）。**固定按北京时间（UTC+8）算**，跟你人在哪、Worker 跑在哪无关 |
+| 单次最长时长 | `120` 分钟 | **每进入一段重新计时**，一段里连续保活最多这么久，到点就停。`0` = 不限 |
 
-**两者是交集**：只在时段内、且本次还没超时长时才续租。所以 `08:00–23:00 + 120 分钟` 的实际效果是「每天 08:00 起保活两小时，然后睡觉，直到第二天 08:00」。
+**两者是交集**：只在某一段内、且这一段还没超时长时才续租。所以 `09:00–12:00` + `14:00–18:00` + `120 分钟` 的实际效果是「上午跑两小时、下午跑两小时，中间和夜里随它睡」。
+
+多段之间**各自计时**：上午 09:00 进去开始算 120 分钟，12:00 出来放租约；下午 14:00 进去重新从 0 开始，不会被上午用掉的时间拖累。
 
 **在哪设**
 
-- **网页面板**：机器表格上方的「保活区间」卡片，开关 + 两个时间输入 + 时长输入，保存即生效
-- **Telegram**：`/window` 打开区间面板，按钮点着改（见 [docs/TELEGRAM.md](docs/TELEGRAM.md)）；也能直接打 `/window 08:00-23:00 120`、`/window off`
+- **账号默认值**：机器表格上方的「保活区间」卡片，开关 + 时间段列表（点「＋ 添加时间段」加一段，每段右边「删除」）+ 时长输入；所有没有单独设置的机器继承它
+- **单台覆盖**：机器表格的「区间」列点任意机器，弹窗里同样可以加多段，或点「跟随默认」删掉覆盖
+- **Telegram**：`/window` 管理默认值，`/window 机器名` 管理单机值（见 [docs/TELEGRAM.md](docs/TELEGRAM.md)）。多段用逗号隔开：`/window 09:00-12:00,14:00-18:00 120`；面板按钮可以按段追加和删除
 
 **几个容易踩的点**
 
 - **手动操作不受限**。面板的「全部续租」、机器人的 `/wake`、`/renew` 都是人按下去的，按了就执行，不会因为「现在不在区间」被拒——否则临时要用机器还得先改配置
 - **离开区间那一轮会主动放租约**（`DELETE` 一次），机器不用干等 TTL 过期。只放一次，不会每 5 分钟一个请求
-- **改区间会重置计时**。正在跑的那一轮 `startedAt` 会被清掉，避免旧的计时让新的上限立刻触顶
-- **跨午夜**：`22:00–06:00` 是合法的，按「≥22:00 或 <06:00」判
-- **起止相同 = 全天**：`08:00–08:00` 等于只受单次时长约束
-- **触顶后要等下一次进入区间才重新计时**。`08:00–23:00 + 120 分钟` 在 10:00 触顶后，当天剩下的时间都不再保活——这是「单次上限」的字面语义，想「跑一会儿歇一会儿」请用更窄的时间段
+- **改区间会重置计时**。正在跑的那一轮 `startedAt` 会被清掉，避免旧的计时让新的上限立刻触顶；改单台只重置那一台，改默认值只重置继承默认值的机器
+- **跨午夜**：每一段都支持，`22:00–06:00` 按「≥22:00 或 <06:00」判
+- **某一段起止相同 = 这一段全天**：`08:00–08:00` 等于整天都算在区间内，只受单次时长约束
+- **触顶后要等下一段开始才重新计时**。上午段 10:00 用满 120 分钟后，当天上午都不再保活；下午段开始会自动重新算——这也是多段最实用的地方
 - 没绑 `CONFIG` KV 时区间存不下来，面板会禁用这块并提示
 
 配置存在 `CONFIG` KV 的 `config` 键里，和暂停、白名单是同一份 JSON：
@@ -282,12 +300,21 @@ Worker 版自带面板，浏览器打开 `https://<你的worker>.workers.dev/ui`
 ```json
 {
   "paused": false,
-  "window": { "on": true, "start": 480, "end": 1380, "maxMin": 120 },
+  "window": {
+    "on": true,
+    "ranges": [
+      { "start": 540, "end": 720 },
+      { "start": 840, "end": 1080 }
+    ],
+    "maxMin": 120
+  },
   "accounts": { "1": { "enabled": true, "mode": "all", "machines": [], "skip": [] } }
 }
 ```
 
-`start` / `end` 是**当天第几分钟**（`480` = 08:00，`1380` = 23:00），`maxMin: 0` 表示不限。运行态（当前处在 `keep` / `idle` / `capped`、本轮从什么时候开始算）写在同一个 KV 的 `win` 键，只在状态翻转时写一次，一天下来就几次读写。
+`ranges` 里每段的 `start` / `end` 是**当天第几分钟**（`540` = 09:00，`1080` = 18:00），`maxMin: 0` 表示不限。最多 8 段，重复段自动去重。**旧的单段格式 `{"start":480,"end":1380}` 仍然能读**，保存时会统一写成 `ranges`，不用手动迁移。
+
+运行态（当前处在 `keep` / `idle` / `capped`、现在在第几段、本轮从什么时候开始算）写在同一个 KV 的 `win` 键，只在状态翻转时写一次，一天下来就几次读写。
 
 ## Telegram 机器人（手机开关机器）
 
@@ -298,7 +325,7 @@ Worker 版自带面板，浏览器打开 `https://<你的worker>.workers.dev/ui`
 /wake qqq      唤醒 + 续租 + 恢复保活
 /sleep qqq     休眠（保留内存，几秒回来）
 /stop qqq      关机（下次冷启动）
-/window        保活区间（时间段 + 单次上限），按钮点着改
+/window [机器] 默认/单机保活区间，按钮点着改
 ```
 
 命令菜单（输入框左侧的 ☰，或直接打 `/`）里已经注册好这 10 条，不用记：
@@ -309,7 +336,7 @@ Worker 版自带面板，浏览器打开 `https://<你的worker>.workers.dev/ui`
 | `/wake` `/sleep` `/stop` | 唤醒 / 休眠 / 关机，不带参数时给按钮选机器 |
 | `/keep <m> on\|off` | 只切保活，不动机器 |
 | `/renew` `/release` | 手动续一次 / 放掉租约 |
-| `/window` | 保活区间面板，也能直接 `/window 08:00-23:00 120` |
+| `/window [机器]` | 默认/单机区间面板，也能 `/window 08:00-23:00 120` |
 | `/pause on\|off` | 全局暂停 / 恢复保活 |
 | `/id` `/help` | 看本聊天 id / 帮助 |
 
@@ -436,7 +463,8 @@ key=ibk_xxx bash <(curl -Ls https://raw.githubusercontent.com/longtimex/instabox
 
 - **自动重试**（已内置）：Worker 遇到 429 / 5xx / 网络错误重试 2 次，并读服务端给的 `retryAfterSeconds`（单次最多等 5 秒，等不起就留给下一轮）；脚本的 curl 带 `--retry 2 --retry-connrefused`，暂时性 409 另外补两次 2s / 4s
 - **暂时性 409 不算失败**：平台在「另一个操作正在跑」（`operation_conflict`）时也回 409，这跟 `machine_not_running` 是两回事 —— 前者等那个操作跑完就好，后者才需要唤醒。错误体里带着 `operationId`，直接 `GET /v1/operations/{id}` 等它，比盲重试准
-- **用官方的 `/wake`**：机器**自己**空闲挂起时，`POST /v1/machines/{id}/wake` 会替我们等最多 45 秒，一次请求顶过去六次状态轮询。你**手动** suspend 的机器 `wake` 不认，才需要 `resume`/`start` —— 现在先读一次机器状态决定走哪条路，不再「resume 失败再 start 兜底」白打请求
+- **`operation_conflict` 重试换新幂等键**：官方要求「等那个操作结束后用**新的** `Idempotency-Key` 重试」。复用同一个 key 有可能拿回第一次那份 409 的缓存响应，看起来像一直失败。429 / 5xx 重试的是同一个请求，才复用 key
+- **用官方的 `/wake`**：机器**自己**空闲挂起时，`POST /v1/machines/{id}/wake` 会替我们等最多 45 秒，一次请求顶过去六次状态轮询。你**手动** suspend 的机器 `wake` 不认，才需要 `resume`/`start` —— 现在先读一次机器状态决定走哪条路，不再「resume 失败再 start 兜底」白打请求。**`/wake` 的客户端超时单独放宽到 48 秒**（其余生命周期调用只回 202，15 秒够），否则慢启动会被误判成失败
 - **等 operation 而不是猜状态**：生命周期调用（start/stop/suspend/resume）返回的是 operation，用 `GET /v1/operations/{id}?wait=25s` 长轮询到 `succeeded`，机器状态确定变了才续租
 - **冷却单独处理**：`machine_cooldown`（max-run 到点、或安全审查锁住）官方给的是分钟级（免费版连着触发能到 2 小时），在请求里重试纯属浪费子请求 —— 现在只上报剩余时间，不重试、也不当成保活故障去告警
 - **唤醒窗口**：`WAKE_TRIES × WAKE_GAP`（默认 6×5=30 秒）现在表示「等唤醒完成的总窗口」，由 operation 长轮询消耗，不再自己 sleep 轮询
@@ -473,10 +501,28 @@ key=ibk_xxx bash <(curl -Ls https://raw.githubusercontent.com/longtimex/instabox
 | 自己空闲挂起（`autoSuspendedAt` 有值） | `POST /v1/machines/{id}/wake` | 服务端替我们等最多 45 秒，一次请求搞定；这机器「用一下就醒」 |
 | 你手动 `suspend` 的 | `POST /resume` | `wake` 对你不生效 —— 手动挂起的机器不会因为「被使用」而醒来 |
 | `stopped` 的 | `POST /start` | 冷启动，文件还在，进程没了 |
+| `error` 的 | `POST /start` | 它没在跑，`resume` 一定 409，只有冷启动可能救回来 |
+| `deleting` / `deleted` | 不唤醒 | 机器正在删或已删，叫醒没有意义，直接报出来 |
 
 所以现在的做法是：续租撞上 409 之后**先读一次机器状态**，按 `state` + `autoSuspendedAt` 决定走哪条路，然后等它返回的 operation `succeeded`，再立刻续租。日志里这条会带 `"resumed":true` 和 `"wake":["wake:200"]`（或 `resume:202` / `start:202`）。
 
-**冷却（`machine_cooldown`）是另一回事**：机器连续运行到 `maxRunMinutes`（免费版固定 480 分钟）会被强制暂停，并进入 5–20 分钟冷却；免费版连着触发会升到 60–75 分钟、120–135 分钟。这期间任何唤醒方式都会被拒（`409 machine_cooldown` + `retryAfterSeconds`），只能等。保活工具这时候叫不醒它，但**也不会按故障告警**——只在 `/status` 和面板里显示 `cooldownUntil`，等冷却结束自己续上。
+> 官方 schema 里 `PUT /activity-leases/{lease}` 的说明是「**waking an idle-suspended machine first**」—— 续租本身就会唤醒自己空闲挂起的机器。所以正常运行时根本走不到唤醒分支，只有手动 suspend / stopped 的机器才会触发 `machine_not_running`。
+
+**冷却（`machine_cooldown`）是另一回事**：机器连续运行到 `maxRunMinutes`（免费版固定 480 分钟）会被强制暂停，并进入 5–20 分钟冷却；免费版连着触发会升到 60–75 分钟、120–135 分钟。这期间任何唤醒方式都会被拒（`409 machine_cooldown` + `retryAfterSeconds`），只能等。
+
+冷却有两种，`cooldownReason` 能分开：
+
+- **没有 `reason`** → max-run 到点，等几分钟就好
+- **`reason=abuse_*`**（`abuse_egress_blocklist` / `abuse_network_flows` / `abuse_cpu`）→ 自动安全审查锁住，**最长 24 小时**，只能等或按官方提示申诉（`instabox feedback` / support@instabox.sh）
+
+面板和机器人会分别显示「冷却中，还剩 …」和「安全审查锁，还剩 …」，别把 24 小时的锁当成普通的几分钟冷却。
+
+还有两个也是平台限制、不该当故障告警的：
+
+- **`429 rate_limited`**：免费版每分钟只允许 3 次 create/start/resume/wake（Pro 30 / Builder 50 / Team 100）。多台机器同时挂起时一轮 cron 会撞上，等一分钟下一轮就好
+- **`402 early_allowance_ended`**：免费额度用完，启动被拒。这个不会自己好，得先暂停/删除一台机器，或者升级套餐
+
+保活工具这时候叫不醒它，但**也不会按故障告警**——只在 `/status` 和面板里显示 `cooldownUntil`（以及用 `runStartedAt` + `maxRunMinutes` 算出的「距 max-run 上限还有多久」），等限制过去自己续上。
 
 设 `INSTABOX_AUTO_RESUME=0` 就只报错、不唤醒。
 
@@ -505,8 +551,10 @@ GET  /api/authinfo             要不要填用户名、走密码还是令牌（�
 POST /api/login                {"username":"admin","password":"...","remember":true,"next":"/ui"}
 POST /api/logout               清掉会话 cookie
 POST /api/account              改用户名/密码：{"currentPassword":"...","user":"admin","password":"新密码（留空不改）"}
-GET  /api/state?token=xxx      账号 + 全部机器 + 当前配置 + 最近一次续租时间 + 保活区间状态（window.phase）
-POST /api/config               改配置：{"paused":true} 或 {"window":{"on":true,"start":480,"end":1380,"maxMin":120}} 或 {"accounts":{"2":{"enabled":true,"mode":"list","machines":["m_x"]}}}
+GET  /api/state?token=xxx      账号 + 全部机器 + 当前配置 + 最近续租时间 + 默认/单机区间状态（machines[].window）
+POST /api/config               改配置：{"window":{...}} 改默认，{"machine":{"account":1,"id":"m_x","window":{...}}} 改单机，window:null 恢复默认
+                               window 里 ranges 是多段数组，如 [{"start":540,"end":720},{"start":840,"end":1080}]；旧的 {"start":480,"end":1380} 也认
+                               也支持 {"paused":true} 和 {"accounts":{"2":{"enabled":true,"mode":"list","machines":["m_x"]}}}
 POST /api/telegram             配机器人：{"telegram":{"token":"…","secret":"…","chats":"1,2"},"register":true}
                                传 {"telegram":null} 清空回退环境变量；不带 token/secret 就是「不改这一项」
 POST /api/renew                手动续租（不受「暂停」影响）
@@ -551,7 +599,7 @@ npx wrangler deploy
 
 ```sh
 cd worker
-npm test          # 用假 KV + 假 API 跑一遍路由/配置/续租/区间/机器人逻辑（81 项）
+npm test          # 用假 KV + 假 API 跑一遍路由/配置/续租/区间/机器人逻辑（123 项）
 npm run build     # 生成 dist/worker.js（面板 HTML 内联进去的单文件版）
 npx wrangler dev dist/worker.js    # 本地起一个，浏览器打开 http://localhost:8787/ui
 ```

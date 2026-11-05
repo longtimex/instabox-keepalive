@@ -20,3 +20,6 @@ pages-dist/
 
 # 说明：worker/dist/worker.js 是构建产物，但故意提交 ——
 # 网页面板部署要粘贴这份单文件，仓库里没有它就得多装一次 node。
+
+# 一次性密钥导入文件（切勿提交）
+token.txt

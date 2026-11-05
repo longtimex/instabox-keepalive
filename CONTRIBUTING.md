@@ -46,7 +46,7 @@ sh tools/run_tests.sh worker   # 只测 worker.js
 
 | job | 跑什么 |
 | --- | --- |
-| `unit` | `node worker/test.mjs`（81 项，进程内假 KV + 假 API + 假 Telegram） |
+| `unit` | `node worker/test.mjs`（123 项，进程内假 KV + 假 API + 假 Telegram） |
 | `shell` | `sh test/shell.test.sh`（26 项，node 假 API） |
 | `alpine` | 同上，在 `alpine:3.22` 的 BusyBox ash 里跑（VPS 上最常见的就是这种） |
 | `integration` | `sh tools/run_tests.sh all`（python 假 API，shell + worker 端到端），ubuntu + alpine 矩阵 |

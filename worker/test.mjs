@@ -17,6 +17,7 @@ function fakeKV(opts = {}) {
       return map.has(key) ? map.get(key) : null;
     },
     async put(key, value) {
+      if (key === "win") fakeKVPutCount += 1;
       map.set(key, value);
     },
     async delete(key) {
@@ -41,6 +42,7 @@ const machinesByKey = () => ({
       state: machineState.m_1,
       autoSuspendedAt: autoPaused.has("m_1") ? "2026-11-03T01:00:00Z" : null,
       cooldownUntil: cooldowns.m_1 ? new Date(Date.now() + cooldowns.m_1 * 1000).toISOString() : null,
+      ...(machineExtra.m_1 || {}),
     },
     {
       id: "m_2",
@@ -48,16 +50,27 @@ const machinesByKey = () => ({
       state: machineState.m_2,
       autoSuspendedAt: autoPaused.has("m_2") ? "2026-11-03T01:00:00Z" : null,
       cooldownUntil: cooldowns.m_2 ? new Date(Date.now() + cooldowns.m_2 * 1000).toISOString() : null,
+      ...(machineExtra.m_2 || {}),
     },
   ],
   ibk_second: [{ id: "m_3", name: "box3", state: machineState.m_3 }],
 });
 let calls = [];
 let hooks = [];
+let fakeKVPutCount = 0;
 const tgCalls = [];
 let leaseFailures = 0;
 let leaseConflicts = 0;
 let leaseRateLimits = 0;
+// 生命周期调用（resume/start/wake）撞 operation_conflict 的次数，以及每次请求带的
+// Idempotency-Key —— 官方要求 operation_conflict 重试时换**新的** key，这里验它
+let lifecycleConflicts = 0;
+const lifecycleKeys = [];
+// 402 early_allowance_ended：免费额度用完，启动被拒
+let lifecycle402 = 0;
+// id -> 额外机器字段（runStartedAt / cooldownReason / free / maxRunMinutes），
+// 默认不设，免得影响老断言的文案
+const machineExtra = {};
 
 globalThis.fetch = async (input, init = {}) => {
   const url = new URL(String(input));
@@ -136,10 +149,36 @@ globalThis.fetch = async (input, init = {}) => {
   if (m && method === "POST") {
     const type = m[2];
     const cur = own.find((x) => x.id === m[1]);
-    // 冷却中：官方说任何唤醒方式都会被拒，带 retryAfterSeconds
-    if (cooldowns[m[1]] && type !== "stop" && type !== "suspend" && type !== "pause") {
+    lifecycleKeys.push({ type, id: m[1], key: init.headers?.["Idempotency-Key"] || "" });
+    // 402 early_allowance_ended：免费额度用完，启动被拒（不可重试）
+    if (lifecycle402 > 0) {
+      lifecycle402--;
       return new Response(
-        JSON.stringify({ error: { code: "machine_cooldown", retryable: true, retryAfterSeconds: cooldowns[m[1]] } }),
+        JSON.stringify({ error: { code: "early_allowance_ended", retryable: false, message: "free allowance ended" } }),
+        { status: 402 },
+      );
+    }
+    // 另一个操作正在跑：官方要求等它结束后用**新的** Idempotency-Key 重试
+    if (lifecycleConflicts > 0) {
+      lifecycleConflicts--;
+      return new Response(
+        JSON.stringify({ error: { code: "operation_conflict", retryable: true, operationId: "op_conflict" } }),
+        { status: 409 },
+      );
+    }
+    // 冷却中：官方说任何唤醒方式都会被拒，带 retryAfterSeconds。
+    // reason 只有安全审查锁（abuse_*）才有，max-run 冷却没有这个字段。
+    if (cooldowns[m[1]] && type !== "stop" && type !== "suspend" && type !== "pause") {
+      const extra = machineExtra[m[1]] || {};
+      return new Response(
+        JSON.stringify({
+          error: {
+            code: "machine_cooldown",
+            retryable: true,
+            retryAfterSeconds: cooldowns[m[1]],
+            ...(extra.cooldownReason ? { reason: extra.cooldownReason } : {}),
+          },
+        }),
         { status: 409, headers: { "Retry-After": String(cooldowns[m[1]]) } },
       );
     }
@@ -1124,6 +1163,60 @@ const winConf = (win) => JSON.stringify({ v: 1, paused: false, window: win, acco
   ok("单次保活上限到点就停（capped）");
 }
 
+// 状态没有变化时，第二轮 cron 不写 win 键
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  fakeKVPutCount = 0;
+  machineState.m_1 = "running";
+  machineState.m_2 = "running";
+  const fixed = new Date().toISOString();
+  e.CONFIG._map.set("config", winConf({ on: false, start: 0, end: 0, maxMin: 0 }));
+  e.CONFIG._map.set("win", JSON.stringify({
+    phase: "keep",
+    startedAt: fixed,
+    at: fixed,
+    machines: {
+      "1:m_1": { phase: "keep", startedAt: fixed, at: fixed, source: "default" },
+      "1:m_2": { phase: "keep", startedAt: fixed, at: fixed, source: "default" },
+    },
+  }));
+  await worker.scheduled({}, e);
+  const writesAfterFirst = fakeKVPutCount;
+  await worker.scheduled({}, e);
+  assert.equal(fakeKVPutCount, writesAfterFirst, "状态没变化时第二轮不应写 win");
+  ok("无变化的 cron 轮次不重复写 win 键");
+}
+
+// 触顶后再跑第二轮仍然 capped，不能重新计时
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_1 = "running";
+  machineState.m_2 = "running";
+  e.CONFIG._map.set("config", winConf({ on: false, start: 0, end: 0, maxMin: 30 }));
+  e.CONFIG._map.set(
+    "win",
+    JSON.stringify({ phase: "keep", startedAt: new Date(Date.now() - 40 * 60000).toISOString() }),
+  );
+  const before1 = calls.length;
+  await worker.scheduled({}, e);
+  assert.ok(!calls.slice(before1).some((c) => c.startsWith("PUT /v1/machines/")), "第一轮已经触顶");
+  const before2 = calls.length;
+  await worker.scheduled({}, e);
+  assert.ok(!calls.slice(before2).some((c) => c.startsWith("PUT /v1/machines/")), "触顶状态必须跨轮保持");
+  assert.equal(JSON.parse(e.CONFIG._map.get("win")).phase, "capped");
+  ok("触顶后第二轮仍然 capped，不会重新计时");
+}
+
+// 机器 id 作为对象键时拒绝原型相关保留字
+{
+  const e = { ...env, CONFIG: fakeKV(), LOG: fakeKV() };
+  const r = await worker.fetch(post("/api/config", { machine: { account: 1, id: "__proto__", window: { on: true } } }, auth), e);
+  assert.equal(r.status, 400);
+  const body = await r.json();
+  assert.match(body.error, /机器 id/);
+  ok("非法机器 id 不会污染配置对象");
+}
+
 // 上限没到：继续保活
 {
   const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
@@ -1171,9 +1264,40 @@ const winConf = (win) => JSON.stringify({ v: 1, paused: false, window: win, acco
   );
   assert.equal(res.status, 200);
   const conf = JSON.parse(e.CONFIG._map.get("config"));
-  assert.deepEqual(conf.window, { on: true, start: 540, end: 1080, maxMin: 120 });
+  // 旧格式 { start, end } 写进来，存下去统一成 ranges（多区间用的新结构）
+  assert.deepEqual(conf.window, { on: true, ranges: [{ start: 540, end: 1080 }], maxMin: 120 });
   assert.equal(e.CONFIG._map.get("win"), undefined, "改区间要清掉旧的 startedAt");
-  ok("/api/config 能改保活区间，并清掉旧计时");
+  ok("/api/config 能改保活区间（旧 start/end 自动转成 ranges），并清掉旧计时");
+}
+
+// 改默认区间只重置继承默认的机器，不碰显式单机覆盖的计时
+{
+  const e = { ...env, CONFIG: fakeKV(), LOG: fakeKV() };
+  e.CONFIG._map.set("config", JSON.stringify({
+    v: 2,
+    paused: false,
+    window: { on: true, ...windowIncludingNow(), maxMin: 0 },
+    accounts: {
+      1: {
+        enabled: true, inheritSelection: true, mode: "all", machines: [], skip: [],
+        windows: { m_1: { on: true, ...windowIncludingNow(), maxMin: 60 } },
+      },
+    },
+  }));
+  const started = new Date(Date.now() - 20 * 60000).toISOString();
+  e.CONFIG._map.set("win", JSON.stringify({
+    phase: "keep",
+    startedAt: started,
+    machines: {
+      "1:m_1": { phase: "keep", startedAt: started, source: "machine" },
+      "1:m_2": { phase: "keep", startedAt: started, source: "default" },
+    },
+  }));
+  await worker.fetch(post("/api/config", { window: { on: true, ...windowExcludingNow(), maxMin: 0 } }, auth), e);
+  const state = JSON.parse(e.CONFIG._map.get("win"));
+  assert.equal(state.machines["1:m_1"] && state.machines["1:m_1"].startedAt, started, "单机自定义计时应保留");
+  assert.equal(state.machines["1:m_2"], undefined, "继承默认的计时应被清掉");
+  ok("改默认区间只重置继承默认的机器");
 }
 
 // /api/state 把区间状态给面板
@@ -1188,6 +1312,300 @@ const winConf = (win) => JSON.stringify({ v: 1, paused: false, window: win, acco
   ok("/api/state 带保活区间状态（面板要用）");
 }
 
+// ---- 多段保活区间 --------------------------------------------------------------
+// 一台机器一天可以有多段时间（上午 + 下午），任意一段命中就续租；
+// 段与段之间机器会休眠，所以换段要重新计单次上限。
+
+// 并集：第一段排除现在、第二段包含现在 → 仍然要续租
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_1 = "running";
+  machineState.m_2 = "running";
+  const inc = windowIncludingNow();
+  const exc = windowExcludingNow();
+  e.CONFIG._map.set("config", winConf({ on: true, ranges: [exc, inc], maxMin: 0 }));
+  const before = calls.length;
+  await worker.scheduled({}, e);
+  const made = calls.slice(before);
+  assert.ok(made.some((c) => c.startsWith("PUT /v1/machines/")), "任意一段命中就该续租");
+  ok("多段区间取并集：第二段命中就续租");
+}
+
+// 全不命中才跳过
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_1 = "running";
+  machineState.m_2 = "running";
+  const a = windowExcludingNow();
+  const b = { start: (a.start + 60) % 1440, end: (a.end + 60) % 1440 };
+  e.CONFIG._map.set("config", winConf({ on: true, ranges: [a, b], maxMin: 0 }));
+  const before = calls.length;
+  await worker.scheduled({}, e);
+  const made = calls.slice(before);
+  assert.ok(!made.some((c) => c.startsWith("PUT /v1/machines/")), "两段都不含现在就不该续租");
+  ok("多段区间全不命中才跳过");
+}
+
+// 换段重置计时：上一段已经 capped，这一段的 seg 不同 → 应该重新开始
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_1 = "running";
+  machineState.m_2 = "running";
+  const inc = windowIncludingNow();
+  e.CONFIG._map.set("config", winConf({ on: true, ranges: [inc], maxMin: 30 }));
+  e.CONFIG._map.set(
+    "win",
+    JSON.stringify({
+      phase: "capped",
+      startedAt: new Date(Date.now() - 60 * 60000).toISOString(),
+      seg: "999-1000",
+      machines: {},
+    }),
+  );
+  const out = await worker.scheduled({}, e);
+  const m1 = out.machines.find((m) => m.id === "m_1");
+  assert.equal(m1.window.phase, "keep", "换段后要重新计时，不能沿用上一段的 capped");
+  assert.equal(m1.window.seg, `${inc.start}-${inc.end}`);
+  ok("多段之间切换会重置单次上限计时");
+}
+
+// 同一段内 capped 不能被重置（否则上限失效）
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_1 = "running";
+  machineState.m_2 = "running";
+  const inc = windowIncludingNow();
+  const seg = `${inc.start}-${inc.end}`;
+  e.CONFIG._map.set("config", winConf({ on: true, ranges: [inc], maxMin: 30 }));
+  e.CONFIG._map.set(
+    "win",
+    JSON.stringify({
+      phase: "capped",
+      startedAt: new Date(Date.now() - 60 * 60000).toISOString(),
+      seg,
+      machines: {},
+    }),
+  );
+  const out = await worker.scheduled({}, e);
+  assert.equal(out.machines.find((m) => m.id === "m_1").window.phase, "capped");
+  ok("同一段内触顶后不会因为多段逻辑被重置");
+}
+
+// /api/config 支持多段默认区间
+{
+  const e = { ...env, CONFIG: fakeKV(), LOG: fakeKV() };
+  const res = await worker.fetch(
+    post(
+      "/api/config",
+      { window: { on: true, ranges: [{ start: 540, end: 720 }, { start: 840, end: 1080 }], maxMin: 60 } },
+      auth,
+    ),
+    e,
+  );
+  assert.equal(res.status, 200);
+  const conf = JSON.parse(e.CONFIG._map.get("config"));
+  assert.deepEqual(conf.window.ranges, [
+    { start: 540, end: 720 },
+    { start: 840, end: 1080 },
+  ]);
+  ok("/api/config 支持多段默认区间");
+}
+
+// 重复段去重、超过 8 段截断
+{
+  const e = { ...env, CONFIG: fakeKV(), LOG: fakeKV() };
+  const ranges = [{ start: 540, end: 720 }];
+  for (let i = 1; i <= 10; i++) ranges.push({ start: 540, end: 720 }, { start: 800 + i, end: 900 + i });
+  await worker.fetch(post("/api/config", { window: { on: true, ranges, maxMin: 0 } }, auth), e);
+  const conf = JSON.parse(e.CONFIG._map.get("config"));
+  assert.equal(conf.window.ranges.length, 8, "最多 8 段");
+  const keys = conf.window.ranges.map((r) => `${r.start}-${r.end}`);
+  assert.equal(new Set(keys).size, keys.length, "重复段要去重");
+  ok("多段区间去重并限制最多 8 段");
+}
+
+
+// 逐机器区间：同一轮里 m_1 在区间内继续续租，m_2 在区间外不续租
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_1 = "running";
+  machineState.m_2 = "running";
+  e.CONFIG._map.set(
+    "config",
+    JSON.stringify({
+      v: 2,
+      paused: false,
+      window: { on: false, start: 0, end: 0, maxMin: 0 },
+      accounts: {
+        1: {
+          enabled: true,
+          inheritSelection: true,
+          mode: "all",
+          machines: [],
+          skip: [],
+          windows: {
+            m_1: { on: true, ...windowIncludingNow(), maxMin: 0 },
+            m_2: { on: true, ...windowExcludingNow(), maxMin: 0 },
+          },
+        },
+      },
+    }),
+  );
+  const before = calls.length;
+  await worker.scheduled({}, e);
+  const made = calls.slice(before).filter((c) => c.startsWith("PUT /v1/machines/"));
+  assert.deepEqual(made, ["PUT /v1/machines/m_1/activity-leases/keepalive"], "两台机器的区间必须彼此隔离");
+  const win = JSON.parse(e.CONFIG._map.get("win"));
+  assert.equal(win.machines["1:m_1"].phase, "keep");
+  assert.equal(win.machines["1:m_2"].phase, "idle");
+  ok("逐机器区间隔离：一台续租、一台不续租");
+}
+
+// 同一账号里一台自定义、一台继承默认：状态各自保留，不互相清理
+{
+  const e = { ...env, CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_1 = "running";
+  machineState.m_2 = "running";
+  const custom = windowIncludingNow();
+  e.CONFIG._map.set(
+    "config",
+    JSON.stringify({
+      v: 2,
+      paused: false,
+      window: { on: false, start: 480, end: 1380, maxMin: 0 },
+      accounts: {
+        1: {
+          enabled: true,
+          inheritSelection: true,
+          mode: "all",
+          machines: [],
+          skip: [],
+          windows: { m_1: { on: true, ...custom, maxMin: 60 } },
+        },
+      },
+    }),
+  );
+  e.CONFIG._map.set(
+    "win",
+    JSON.stringify({
+      phase: "keep",
+      startedAt: new Date(Date.now() - 30 * 60000).toISOString(),
+      machines: {
+        "1:m_1": { phase: "keep", startedAt: new Date(Date.now() - 30 * 60000).toISOString(), source: "machine" },
+      },
+    }),
+  );
+  const before = calls.length;
+  await worker.scheduled({}, e);
+  const leased = calls.slice(before).filter((c) => c.startsWith("PUT /v1/machines/"));
+  assert.ok(leased.some((c) => c.includes("/m_1/")), "自定义区间应继续续租");
+  assert.ok(leased.some((c) => c.includes("/m_2/")), "继承默认区间的机器也要续租");
+  const state = JSON.parse(e.CONFIG._map.get("win"));
+  assert.ok(state.machines["1:m_1"], "自定义机器的计时不能被继承机器的首次运行清掉");
+  assert.equal(state.machines["1:m_1"].startedAt !== null, true);
+  ok("自定义/继承默认的机器状态互不覆盖");
+}
+
+// 单台区间不能把 INSTABOX_MACHINE 的筛选范围意外改成“全部机器”
+{
+  const e = { ...env, INSTABOX_MACHINE: "qqq", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_1 = "running";
+  machineState.m_2 = "suspended";
+  const r = await worker.fetch(
+    post("/api/config", { machine: { account: 1, id: "m_1", window: { on: true, ...windowIncludingNow(), maxMin: 0 } } }, auth),
+    e,
+  );
+  assert.equal(r.status, 200);
+  const conf = JSON.parse(e.CONFIG._map.get("config"));
+  assert.equal(conf.accounts["1"].inheritSelection, true);
+  const before = calls.length;
+  await worker.scheduled({}, e);
+  const leased = calls.slice(before).filter((c) => c.startsWith("PUT /v1/machines/"));
+  assert.deepEqual(leased, ["PUT /v1/machines/m_1/activity-leases/keepalive"], "环境变量 machine=qqq 仍然生效");
+  ok("单台区间配置不改变 INSTABOX_MACHINE 的筛选范围");
+}
+
+// /api/config 保存机器区间，/api/state 回显继承关系和设置
+{
+  const e = { ...env, CONFIG: fakeKV(), LOG: fakeKV() };
+  const res = await worker.fetch(
+    post("/api/config", { machine: { account: 1, id: "m_1", window: { on: true, start: 540, end: 1080, maxMin: 90 } } }, auth),
+    e,
+  );
+  assert.equal(res.status, 200);
+  const conf = JSON.parse(e.CONFIG._map.get("config"));
+  assert.deepEqual(conf.accounts["1"].windows.m_1, { on: true, ranges: [{ start: 540, end: 1080 }], maxMin: 90 });
+  const sj = await (await worker.fetch(req("/api/state", { headers: auth }), e)).json();
+  const m1 = sj.machines.find((m) => m.id === "m_1");
+  const m2 = sj.machines.find((m) => m.id === "m_2");
+  assert.equal(m1.window.inherited, false);
+  assert.equal(m1.window.maxMin, 90);
+  assert.equal(m2.window.inherited, true);
+  ok("Web 接口保存并回显逐机器区间");
+}
+
+// 无覆盖恢复默认与其它配置同时提交时，其它配置不能丢
+{
+  const e = { ...env, CONFIG: fakeKV(), LOG: fakeKV() };
+  const res = await worker.fetch(
+    post("/api/config", { paused: true, machine: { account: 1, id: "m_1", window: null } }, auth),
+    e,
+  );
+  assert.equal(res.status, 200);
+  const conf = JSON.parse(e.CONFIG._map.get("config"));
+  assert.equal(conf.paused, true, "同一请求里的 paused 不能被无操作的恢复默认吞掉");
+  assert.equal(conf.accounts["1"], undefined, "不应凭空创建账号配置");
+  ok("无覆盖恢复默认不会吞掉同一请求的其它修改");
+}
+
+// 从未设置覆盖时“恢复默认”必须是无操作，不能新建空账号配置
+{
+  const e = { ...env, CONFIG: fakeKV(), LOG: fakeKV() };
+  const before = e.CONFIG._map.get("config");
+  const res = await worker.fetch(post("/api/config", { machine: { account: 1, id: "m_1", window: null } }, auth), e);
+  assert.equal(res.status, 200);
+  const out = await res.json();
+  assert.equal(out.unchanged, true);
+  assert.equal(e.CONFIG._map.get("config"), before, "无覆盖时不应写 config");
+  ok("恢复默认为无操作时不写空配置");
+}
+
+// Web 打开带 skip 的机器时，需要显式清掉 skip 并恢复 cron 续租
+{
+  const e = { ...env, CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_1 = "running";
+  machineState.m_2 = "running";
+  e.CONFIG._map.set("config", JSON.stringify({
+    v: 2,
+    paused: false,
+    window: { on: false, start: 480, end: 1380, maxMin: 0 },
+    accounts: { 1: { enabled: true, mode: "all", machines: [], skip: ["m_1"], inheritSelection: false, windows: {} } },
+  }));
+  await worker.fetch(post("/api/config", { accounts: { 1: { skip: [] } } }, auth), e);
+  const conf = JSON.parse(e.CONFIG._map.get("config"));
+  assert.deepEqual(conf.accounts["1"].skip, []);
+  const before = calls.length;
+  await worker.scheduled({}, e);
+  const leased = calls.slice(before).filter((c) => c.startsWith("PUT /v1/machines/"));
+  assert.ok(leased.some((c) => c.includes("/m_1/")), "清空 skip 后 m_1 应恢复续租");
+  ok("API 清空 skip 后机器恢复 cron 保活");
+}
+
+// 恢复默认后删除覆盖，回到账号默认区间
+{
+  const e = { ...env, CONFIG: fakeKV(), LOG: fakeKV() };
+  await worker.fetch(
+    post("/api/config", { machine: { account: 1, id: "m_1", window: { on: true, start: 540, end: 1080, maxMin: 90 } } }, auth),
+    e,
+  );
+  const reset = await worker.fetch(post("/api/config", { machine: { account: 1, id: "m_1", window: null } }, auth), e);
+  assert.equal(reset.status, 200);
+  const conf = JSON.parse(e.CONFIG._map.get("config"));
+  assert.equal(conf.accounts["1"].windows.m_1, undefined);
+  const sj = await (await worker.fetch(req("/api/state", { headers: auth }), e)).json();
+  assert.equal(sj.machines.find((m) => m.id === "m_1").window.inherited, true);
+  ok("恢复默认会删除单机覆盖");
+}
 
 // ---- Telegram 机器人 --------------------------------------------------------
 // 重点不是命令回得漂亮，而是两件事：
@@ -1282,6 +1700,17 @@ const sentText = () => (lastTg()?.body?.text || "");
   ok("/ls 列出机器并给出 inline 按钮");
 }
 
+// 首次 /sleep 只新增 skip，不应把 INSTABOX_MACHINE 的筛选范围改成 mode=all
+{
+  const e = tgEnv({ INSTABOX_MACHINE: "qqq" });
+  machineState.m_1 = "running";
+  await worker.fetch(tgPost(msgUpdate("/sleep qqq")), e);
+  const conf = JSON.parse(e.CONFIG._map.get("config"));
+  assert.equal(conf.accounts["1"].inheritSelection, true);
+  assert.deepEqual(conf.accounts["1"].skip, ["m_1"]);
+  ok("Telegram 首次关闭机器仍跟随 INSTABOX_MACHINE");
+}
+
 // 6. /sleep：suspend + 释放租约 + 写进 CONFIG 的 skip 名单
 {
   const e = tgEnv();
@@ -1355,6 +1784,274 @@ const sentText = () => (lastTg()?.body?.text || "");
   assert.match(sentText(), /10 分钟/);
   delete cooldowns.m_2;
   ok("/wake 遇到冷却回执带剩余时间");
+}
+
+// Telegram 从白名单外打开保活：必须真正加入选中并恢复 cron
+{
+  const e = tgEnv();
+  machineState.m_1 = "running";
+  machineState.m_2 = "running";
+  e.CONFIG._map.set("config", JSON.stringify({
+    v: 2,
+    paused: false,
+    window: { on: false, start: 480, end: 1380, maxMin: 0 },
+    accounts: { 1: { enabled: true, mode: "list", machines: ["m_2"], skip: ["m_1"], inheritSelection: false, windows: {} } },
+  }));
+  await worker.fetch(tgPost(msgUpdate("/keep qqq on")), e);
+  const conf = JSON.parse(e.CONFIG._map.get("config"));
+  assert.equal(conf.accounts["1"].mode, "list");
+  assert.deepEqual(conf.accounts["1"].machines.slice().sort(), ["m_1", "m_2"]);
+  assert.deepEqual(conf.accounts["1"].skip, []);
+  const before = calls.length;
+  await worker.scheduled({}, e);
+  const leased = calls.slice(before).filter((c) => c.startsWith("PUT /v1/machines/"));
+  assert.ok(leased.some((c) => c.includes("/m_1/")), "打开后 m_1 必须恢复续租");
+  const snap = await (await worker.fetch(req("/api/state", { headers: auth }), e)).json();
+  assert.equal(snap.machines.find((m) => m.id === "m_1").selected, true);
+  ok("Telegram 打开白名单外机器会真正恢复保活");
+}
+
+// 账号被面板停用时，Telegram 打开单机也必须恢复账号与 cron
+{
+  const e = tgEnv();
+  machineState.m_1 = "running";
+  machineState.m_2 = "running";
+  e.CONFIG._map.set("config", JSON.stringify({
+    v: 2, paused: false, window: { on: false, start: 480, end: 1380, maxMin: 0 },
+    accounts: { 1: { enabled: false, mode: "all", machines: [], skip: [], inheritSelection: false, windows: {} } },
+  }));
+  await worker.fetch(tgPost(msgUpdate("/keep qqq on")), e);
+  const conf = JSON.parse(e.CONFIG._map.get("config"));
+  assert.equal(conf.accounts["1"].enabled, true);
+  assert.deepEqual(conf.accounts["1"].skip, []);
+  const before = calls.length;
+  await worker.scheduled({}, e);
+  assert.ok(calls.slice(before).some((c) => c.startsWith("PUT /v1/machines/m_1/activity-leases/")), "打开后账号必须恢复续租");
+  ok("Telegram 打开账号停用机器会恢复账号保活");
+}
+
+// INSTABOX_MACHINE 排除机器时，Telegram 打开必须物化白名单
+{
+  const e = tgEnv({ INSTABOX_MACHINE: "m_2" });
+  machineState.m_1 = "running";
+  machineState.m_2 = "running";
+  await worker.fetch(tgPost(msgUpdate("/keep qqq on")), e);
+  const conf = JSON.parse(e.CONFIG._map.get("config"));
+  assert.equal(conf.accounts["1"].mode, "list");
+  assert.equal(conf.accounts["1"].inheritSelection, false);
+  assert.deepEqual(conf.accounts["1"].machines.sort(), ["m_1", "m_2"]);
+  const before = calls.length;
+  await worker.scheduled({}, e);
+  assert.ok(calls.slice(before).some((c) => c.startsWith("PUT /v1/machines/m_1/activity-leases/")), "物化白名单后 m_1 必须续租");
+  ok("Telegram 打开环境变量排除机器会物化白名单");
+}
+
+// Telegram 关闭再打开：详情状态与 cron 双向一致
+{
+  const e = tgEnv();
+  machineState.m_1 = "running";
+  await worker.fetch(tgPost(msgUpdate("/keep qqq off")), e);
+  let snap = await (await worker.fetch(req("/api/state", { headers: auth }), e)).json();
+  assert.equal(snap.machines.find((m) => m.id === "m_1").selected, false);
+  await worker.fetch(tgPost(msgUpdate("/keep qqq on")), e);
+  snap = await (await worker.fetch(req("/api/state", { headers: auth }), e)).json();
+  assert.equal(snap.machines.find((m) => m.id === "m_1").selected, true);
+  const before = calls.length;
+  await worker.scheduled({}, e);
+  assert.ok(calls.slice(before).some((c) => c.startsWith("PUT /v1/machines/m_1/activity-leases/")), "重新打开后应续租");
+  ok("Telegram 保活关闭/打开状态与 cron 一致");
+}
+
+// 跨午夜任意时段 + 上限
+{
+  const e = tgEnv();
+  machineState.m_1 = "running";
+  const res = await worker.fetch(tgPost(msgUpdate("/window qqq 22:15-06:45 120")), e);
+  assert.equal(res.status, 200);
+  const conf = JSON.parse(e.CONFIG._map.get("config"));
+  assert.deepEqual(conf.accounts["1"].windows.m_1, { on: true, ranges: [{ start: 1335, end: 405 }], maxMin: 120 });
+  ok("Telegram 支持自定义跨午夜时段");
+}
+
+// 一条命令设多段：逗号 / 顿号 / 空格分隔都认，末尾数字是上限
+{
+  const e = tgEnv();
+  machineState.m_1 = "running";
+  const res = await worker.fetch(tgPost(msgUpdate("/window qqq 09:00-12:00,14:00-18:00 90")), e);
+  assert.equal(res.status, 200);
+  const conf = JSON.parse(e.CONFIG._map.get("config"));
+  assert.deepEqual(conf.accounts["1"].windows.m_1.ranges, [
+    { start: 540, end: 720 },
+    { start: 840, end: 1080 },
+  ]);
+  assert.equal(conf.accounts["1"].windows.m_1.maxMin, 90);
+  const msg = tgCalls.filter((x) => x.method === "sendMessage").at(-1);
+  assert.match(msg.body.text || "", /2 段/, "面板要写明有几段");
+  assert.match(msg.body.text || "", /09:00 – 12:00/);
+  ok("Telegram 一条命令设多段区间");
+}
+
+// 面板按钮：追加一段、删掉一段
+{
+  const e = tgEnv();
+  machineState.m_1 = "running";
+  await worker.fetch(tgPost(msgUpdate("/window qqq 09:00-12:00,14:00-18:00")), e);
+
+  // 加第三段（22:00–06:00 跨午夜）
+  await worker.fetch(tgPost(cbUpdate("w:m:1:m_1:add:1320:360")), e);
+  let conf = JSON.parse(e.CONFIG._map.get("config"));
+  assert.equal(conf.accounts["1"].windows.m_1.ranges.length, 3, "追加后应该有三段");
+
+  // 删第一段
+  await worker.fetch(tgPost(cbUpdate("w:m:1:m_1:del:0")), e);
+  conf = JSON.parse(e.CONFIG._map.get("config"));
+  assert.deepEqual(conf.accounts["1"].windows.m_1.ranges, [
+    { start: 840, end: 1080 },
+    { start: 1320, end: 360 },
+  ]);
+  ok("Telegram 面板可以按段追加和删除");
+}
+
+// 删掉不存在的段要拒绝，不能静默改配置
+{
+  const e = tgEnv();
+  machineState.m_1 = "running";
+  await worker.fetch(tgPost(msgUpdate("/window qqq 09:00-12:00")), e);
+  const before = e.CONFIG._map.get("config");
+  await worker.fetch(tgPost(cbUpdate("w:m:1:m_1:del:9")), e);
+  assert.equal(e.CONFIG._map.get("config"), before, "越界删除不该改配置");
+  assert.match(tgCalls.filter((x) => x.method === "sendMessage" || x.method === "editMessageText").at(-1).body.text || "", /不在了/);
+  ok("Telegram 删除越界段被拒绝");
+}
+
+// 非法时间和超出范围的上限必须拒绝，不能静默写成默认值
+{
+  const e = tgEnv();
+  const before = e.CONFIG._map.get("config");
+  await worker.fetch(tgPost(msgUpdate("/window qqq 25:00-08:00 90")), e);
+  assert.equal(e.CONFIG._map.get("config"), before, "非法时间不能写配置");
+  assert.match(tgCalls.filter((x) => x.method === "sendMessage").at(-1).body.text || "", /用法/);
+  await worker.fetch(tgPost(msgUpdate("/window qqq 09:00-18:00 9999")), e);
+  assert.equal(e.CONFIG._map.get("config"), before, "超范围上限不能写配置");
+  ok("Telegram 拒绝非法时间和超范围上限");
+}
+
+// 详情页真实 callback：开 → 关 → 开，回读详情和 cron 一致
+{
+  const e = tgEnv();
+  machineState.m_1 = "running";
+  await worker.fetch(tgPost(msgUpdate("/ls")), e);
+  await worker.fetch(tgPost(cbUpdate("d:1:m_1")), e);
+  const detailKb = tgCalls.filter((x) => x.method === "editMessageText").at(-1).body.reply_markup.inline_keyboard;
+  const keepButton = detailKb.flat().find((x) => x.callback_data.startsWith("a:keep"));
+  assert.ok(keepButton, "详情页应有保活开关按钮");
+  await worker.fetch(tgPost(cbUpdate(keepButton.callback_data)), e);
+  let snap = await (await worker.fetch(req("/api/state", { headers: auth }), e)).json();
+  assert.equal(snap.machines.find((m) => m.id === "m_1").selected, false);
+  const offKb = tgCalls.filter((x) => x.method === "editMessageText").at(-1).body.reply_markup.inline_keyboard;
+  const onButton = offKb.flat().find((x) => x.callback_data.startsWith("a:keep"));
+  assert.ok(onButton && onButton.callback_data.includes("keepon"), "关闭后按钮应变成打开");
+  await worker.fetch(tgPost(cbUpdate(onButton.callback_data)), e);
+  snap = await (await worker.fetch(req("/api/state", { headers: auth }), e)).json();
+  assert.equal(snap.machines.find((m) => m.id === "m_1").selected, true);
+  ok("Telegram 详情页保活按钮双向可用");
+}
+
+// 任意起止时间 + 单次上限可一次设置
+{
+  const e = tgEnv();
+  machineState.m_1 = "running";
+  const res = await worker.fetch(tgPost(msgUpdate("/window qqq 06:35-22:47 95")), e);
+  assert.equal(res.status, 200);
+  const conf = JSON.parse(e.CONFIG._map.get("config"));
+  assert.deepEqual(conf.accounts["1"].windows.m_1, { on: true, ranges: [{ start: 395, end: 1367 }], maxMin: 95 });
+  // sendMessage 一定是最后一次 Bot API 调用；tgCalls 里还可能有查询/编辑调用。
+  const message = tgCalls.filter((x) => x.method === "sendMessage").at(-1);
+  assert.ok(message, "应有区间回执");
+  assert.match(message.body.text || "", /06:35/);
+  assert.match(message.body.text || "", /22:47/);
+  assert.match(message.body.text || "", /95 分钟/);
+  ok("Telegram 支持任意起止时间和单次上限");
+}
+
+// /window <机器> 设置单机区间，不影响默认区间
+{
+  const e = tgEnv();
+  machineState.m_1 = "running";
+  const r = await worker.fetch(tgPost(msgUpdate("/window qqq 09:00-18:00")), e);
+  assert.equal(r.status, 200);
+  const conf = JSON.parse(e.CONFIG._map.get("config"));
+  assert.deepEqual(conf.accounts["1"].windows.m_1, { on: true, ranges: [{ start: 540, end: 1080 }], maxMin: 0 });
+  assert.equal(conf.accounts["1"].inheritSelection, true, "单机区间不应改机器筛选");
+  assert.deepEqual(
+    conf.window,
+    { on: false, ranges: [{ start: 480, end: 1380 }], maxMin: 0 },
+    "默认区间不应被改",
+  );
+  assert.match(sentText(), /qqq 的保活区间/);
+  ok("Telegram /window 机器名 设置单机区间");
+}
+
+// 机器详情里的区间按钮 → 上限按钮，回调带 account:id，重启后仍能定位
+{
+  const e = tgEnv();
+  machineState.m_1 = "running";
+  await worker.fetch(tgPost(msgUpdate("/window qqq")), e);
+  const kb = lastTg().body.reply_markup.inline_keyboard;
+  const machineCb = kb.flat().find((x) => x.text.includes("上限 2h"));
+  assert.ok(machineCb.callback_data.startsWith("w:m:1:m_1:max:"));
+  await worker.fetch(tgPost(cbUpdate(machineCb.callback_data)), e);
+  const conf = JSON.parse(e.CONFIG._map.get("config"));
+  assert.deepEqual(conf.accounts["1"].windows.m_1, { on: false, ranges: [{ start: 480, end: 1380 }], maxMin: 120 });
+  assert.match(lastTg().body.text, /qqq 的保活区间/);
+  ok("Telegram 单机区间按钮会按机器保存上限");
+}
+
+// 自定义时段引导页必须保留返回按钮
+{
+  const e = tgEnv();
+  machineState.m_1 = "running";
+  await worker.fetch(tgPost(msgUpdate("/window qqq")), e);
+  const kb = tgCalls.filter((x) => x.method === "sendMessage").at(-1).body.reply_markup.inline_keyboard;
+  const custom = kb.flat().find((x) => x.callback_data.endsWith(":custom"));
+  assert.ok(custom, "区间面板应有任意时段按钮");
+  await worker.fetch(tgPost(cbUpdate(custom.callback_data)), e);
+  const edited = tgCalls.filter((x) => x.method === "editMessageText").at(-1);
+  const back = edited.body.reply_markup.inline_keyboard.flat();
+  assert.ok(back.some((x) => x.callback_data === "d:1:m_1"), "自定义引导页应能返回机器详情");
+  assert.match(edited.body.text, /09:15-17:45 90/);
+  ok("Telegram 自定义时段引导页可返回");
+}
+
+// 坏 URL 编码的回调只回参数错误，不能抛异常触发 Telegram 重投
+{
+  const e = tgEnv();
+  const before = tgCalls.length;
+  const r = await worker.fetch(tgPost(cbUpdate("w:m:1:%E0%A4%A:max:120")), e);
+  assert.equal(r.status, 200);
+  assert.equal(tgCalls.length, before + 2, "只应答 callback + 编辑错误提示");
+  assert.match(tgCalls[before + 1].body.text, /机器参数不对/);
+  ok("Telegram 坏编码回调被安全拒绝");
+}
+
+// 机器区间 reset 回到默认
+{
+  const e = tgEnv();
+  machineState.m_1 = "running";
+  e.CONFIG._map.set(
+    "config",
+    JSON.stringify({
+      v: 2,
+      paused: false,
+      window: { on: false, start: 480, end: 1380, maxMin: 0 },
+      accounts: { 1: { mode: "all", machines: [], skip: [], inheritSelection: true, windows: { m_1: { on: true, start: 540, end: 1080, maxMin: 60 } } } },
+    }),
+  );
+  await worker.fetch(tgPost(msgUpdate("/window qqq reset")), e);
+  const conf = JSON.parse(e.CONFIG._map.get("config"));
+  assert.equal(conf.accounts["1"].windows.m_1, undefined);
+  assert.match(sentText(), /跟随默认区间/);
+  ok("Telegram 单机区间可恢复跟随默认");
 }
 
 // 9. 回调按钮走通：点机器看详情 → 点休眠
@@ -1535,6 +2232,129 @@ const sentText = () => (lastTg()?.body?.text || "");
   assert.equal(forged.status, 403, "没有 secret 串就不该接受 update");
   assert.equal(tgCalls.length, 0, "更不能真的去动机器");
   ok("没填 secret 时自动生成，裸 /tg 打不进来");
+}
+
+// ---- 官方文档对齐（2026-11 复查 instabox.sh/docs + openapi.json）------------
+// 这一节盯的是「官方明确写了、但我们原来没照做」的几处：
+//   · operation_conflict 重试要换新的 Idempotency-Key
+//   · state 枚举里有 error / deleting，不能一律按 resume+start 兜底
+//   · 429 rate_limited（免费版每分钟 3 次启动）和 402 early_allowance_ended 不是保活故障
+//   · cooldownReason 区分安全审查锁（最长 24 小时）和 max-run 冷却
+//   · runStartedAt + maxRunMinutes 能算出「还有多久到上限」
+
+// operation_conflict：官方要求「等那个操作结束后用新的 Idempotency-Key 重试」。
+// 复用同一个 key 有可能拿回第一次那份 409 的缓存响应，看起来像一直失败。
+{
+  machineState.m_2 = "suspended";
+  autoPaused.delete("m_2");
+  lifecycleKeys.length = 0;
+  lifecycleConflicts = 1;
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  await worker.fetch(post("/api/renew", {}, auth), e);
+  assert.ok(lifecycleKeys.length >= 2, "撞 operation_conflict 后应该重试");
+  assert.notEqual(lifecycleKeys[0].key, lifecycleKeys[1].key, "重试必须换新的 Idempotency-Key");
+  lifecycleConflicts = 0;
+  machineState.m_2 = "suspended";
+  ok("operation_conflict 重试换新的 Idempotency-Key");
+}
+
+// error 状态：resume 一定 409（它没在跑），只有冷启动可能救回来，别白打一次
+{
+  machineState.m_2 = "error";
+  autoPaused.delete("m_2");
+  lifecycleKeys.length = 0;
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  await worker.fetch(post("/api/renew", {}, auth), e);
+  const types = lifecycleKeys.map((k) => k.type);
+  assert.equal(types.includes("resume"), false, "error 状态不该先试 resume");
+  assert.equal(types.includes("start"), true, "error 状态应该直接 start");
+  machineState.m_2 = "suspended";
+  ok("error 状态跳过 resume，直接 start");
+}
+
+// deleting / deleted：叫醒没有意义，直接说清楚，别白发 resume/start
+{
+  machineState.m_2 = "deleting";
+  lifecycleKeys.length = 0;
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  const out = await (await worker.fetch(post("/api/renew", {}, auth), e)).json();
+  assert.equal(lifecycleKeys.length, 0, "deleting 状态不该发任何生命周期请求");
+  assert.match(out.machines.find((m) => m.id === "m_2").error, /删除/);
+  machineState.m_2 = "suspended";
+  ok("deleting 状态直接说明，不白发唤醒请求");
+}
+
+// 429 rate_limited：免费版每分钟只允许 3 次 create/start/resume/wake。
+// 多台机器同时挂起时会撞上，等一分钟就好 —— 不该按「保活挂了」告警。
+{
+  machineState.m_2 = "suspended";
+  hooks.length = 0;
+  leaseRateLimits = 10;
+  const e = {
+    ...env,
+    INSTABOX_MACHINE: "",
+    ALERT_WEBHOOK: "https://hook.test/alert",
+    CONFIG: fakeKV(),
+    LOG: fakeKV(),
+  };
+  await worker.scheduled({}, e);
+  assert.equal(hooks.length, 0, "启动限流不该报警");
+
+  leaseRateLimits = 10;
+  const out = await (
+    await worker.fetch(post("/api/renew", {}, auth), { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() })
+  ).json();
+  const m2 = out.machines.find((m) => m.id === "m_2");
+  assert.equal(m2.limit, "throttled", "429 要标成平台限流");
+  assert.match(m2.error, /限流/);
+  leaseRateLimits = 0;
+  ok("429 rate_limited 标成平台限流，不报警");
+}
+
+// 402 early_allowance_ended：免费额度用完，启动被拒。不会自己好，得腾一台或升级。
+{
+  machineState.m_2 = "suspended";
+  autoPaused.delete("m_2");
+  lifecycle402 = 1;
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  const out = await (await worker.fetch(post("/api/renew", {}, auth), e)).json();
+  const m2 = out.machines.find((m) => m.id === "m_2");
+  assert.equal(m2.limit, "blocked");
+  assert.match(m2.error, /免费额度/);
+  lifecycle402 = 0;
+  machineState.m_2 = "suspended";
+  ok("402 early_allowance_ended 单独说明（不会自己好）");
+}
+
+// cooldownReason=abuse_* 是安全审查锁（最长 24 小时），和 max-run 冷却不是一回事
+{
+  machineState.m_2 = "suspended";
+  cooldowns.m_2 = 3600;
+  machineExtra.m_2 = { cooldownReason: "abuse_cpu" };
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  const out = await (await worker.fetch(post("/api/renew", {}, auth), e)).json();
+  const m2 = out.machines.find((m) => m.id === "m_2");
+  assert.equal(m2.limit, "abuse");
+  assert.match(m2.error, /安全审查锁/);
+  delete cooldowns.m_2;
+  delete machineExtra.m_2;
+  machineState.m_2 = "suspended";
+  ok("abuse 锁和 max-run 冷却分开提示");
+}
+
+// runStartedAt + maxRunMinutes：面板和机器人靠它算「还有多久到上限」
+{
+  machineState.m_1 = "running";
+  const startedAt = new Date(Date.now() - 60 * 60000).toISOString();
+  machineExtra.m_1 = { runStartedAt: startedAt, maxRunMinutes: 480, free: true };
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  const out = await (await worker.fetch(req("/api/state", { headers: auth }), e)).json();
+  const m1 = out.machines.find((m) => m.id === "m_1");
+  assert.equal(m1.runStartedAt, startedAt, "要带本轮 run 起点");
+  assert.equal(m1.maxRunMinutes, 480);
+  assert.equal(m1.free, true);
+  delete machineExtra.m_1;
+  ok("/api/state 带 runStartedAt / maxRunMinutes / free");
 }
 
 console.log("\n" + passed + " 项通过");

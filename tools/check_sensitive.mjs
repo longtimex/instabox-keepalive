@@ -77,6 +77,7 @@ for (const file of files) {
       const value = match[0].toLowerCase();
       if (
         value.endsWith("@users.noreply.github.com") ||
+        value === "support@instabox.sh" ||
         value.endsWith("@example.com") ||
         value.endsWith("@example.org")
       ) {

@@ -10,6 +10,8 @@ compatibility_date = "2026-10-16"
 # 余量 = TTL / 间隔 = 3 倍：能扛住 2 轮连续失败或 cron 延迟。
 # 别把间隔压到和 TTL 差不多（例如 */9 + 900 = 1.67 倍）—— Cloudflare 的 cron 不保证准点，
 # 一轮延迟加一轮失败，机器就睡了。
+# 官方 schema 对租约的说明是「Expiry starts a full idle period」：过期之后才开始计
+# 30 分钟空闲，所以真实容错还要再加 30 分钟，比这张表看着更宽。
 [triggers]
 crons = ["*/5 * * * *"]
 
@@ -21,7 +23,8 @@ INSTABOX_LEASE = "keepalive"
 INSTABOX_LEASE_TTL = "900"
 # 写 KV 的频次，免费额度每天 1000 次写：hourly 每小时最多 1 条（~24/天）、every 每次都写、off 不写
 INSTABOX_LOG_MODE = "hourly"
-# 机器被挂起/停掉后续租会 409 machine_not_running：默认先 resume（stopped 用 start 兜底）再续租，设 0 关掉
+# 机器被挂起/停掉后续租会 409 machine_not_running：默认按状态分流唤醒
+# （自己空闲挂起的用 /wake，手动 suspend 的用 /resume，stopped / error 用 /start）再续租，设 0 关掉
 INSTABOX_AUTO_RESUME = "1"
 # 等唤醒完成的总窗口 = 次数 × 间隔秒（默认 6×5 = 30 秒，机器启动慢就再放宽）。
 # 实际靠 GET /v1/operations/{id}?wait=25s 长轮询消耗，不再自己 sleep 轮询。
@@ -63,8 +66,8 @@ ALERT_MIN_INTERVAL = "1800"
 # KV 绑定（可选，两个都能用同一个 namespace，也可以各建一个）：
 #   LOG     保活日志，/log 和面板的「最近日志」用它
 #   CONFIG  面板的开关（每台机器保不保活、账号开关、全局暂停、保活区间）+ 最近一次续租时间
-#           保活区间不需要新环境变量：时段和单次上限都存在 CONFIG 的 config 键里，
-#           运行态（keep / idle / capped、本轮起算时间）在同 KV 的 win 键。
+#           保活区间默认值和单机覆盖都存在 CONFIG 的 config 键里；
+#           运行态（每台机器的 keep / idle / capped、本轮起算时间）在同 KV 的 win 键。
 #           没绑 CONFIG 就只能在环境变量层面跑，面板的区间卡片会禁用。
 # 建法：dashboard → Storage & Databases → KV → Create namespace → 复制 id 填到下面
 # 都不绑也能跑，只是 /log 空、面板变成只读（能看能手动续租，开关存不下来）

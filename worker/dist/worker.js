@@ -28,7 +28,8 @@
 //   GET  /log                 最近 48 条保活日志（需要 KV 绑定 LOG）
 //   GET  /release             放掉租约
 //   GET  /api/state           面板用的全量快照（账号 + 机器 + 配置 + 最近续租）
-//   POST /api/config          改配置：{ paused?, accounts: { "2": { enabled, mode, machines } } }
+//   POST /api/config          改配置：{ paused?, window?, machine?, accounts? }
+//                             machine = { account, id, window }，window:null 恢复继承默认
 //   POST /api/renew           手动续租（不吃「暂停」，忽略 paused）
 //   POST /api/release         放掉租约
 //   POST /api/machine         { account, id, action: renew|resume|start|release }
@@ -159,6 +160,12 @@ td .btn+.btn{margin-left:6px}
 .wbar input[type=text]{width:210px}
 .wbar input[type=password]{width:250px}
 .wbar .wtag{font-size:13px}
+/* 多段时间：一行一段，窄屏整段换行，不把「09:00 至 12:00」拆开 */
+.wranges{display:flex;flex-direction:column;gap:8px;padding:10px 16px 0}
+.wrange{display:flex;align-items:center;gap:6px;flex-wrap:wrap;white-space:nowrap}
+/* flex:0 0 auto 必须加：不然窄屏会把时间框压到放不下时钟图标 */
+.wrange input[type=time]{flex:0 0 auto;font:inherit;font-size:13px;padding:5px 8px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text);width:104px}
+.wfoot{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 16px 0;font-size:12px}
 .wstate{padding:8px 16px 14px;font-size:12.5px;color:var(--muted)}
 .wstate.warn{color:var(--warn)}
 
@@ -210,6 +217,9 @@ dialog.modal .field input{
   border:1px solid var(--line);background:var(--bg);color:var(--text);
 }
 dialog.modal .field input:focus{outline:2px solid var(--accent-weak);border-color:var(--accent)}
+dialog.modal .field input[type=checkbox]{width:auto;margin:0 8px 0 0;vertical-align:middle}
+dialog.modal .field .wgrp{display:flex;align-items:center;gap:6px}
+dialog.modal .field .wgrp input[type=time]{width:auto;min-width:0;flex:1}
 dialog.modal .err{color:var(--bad);font-size:12.5px;margin:0 0 12px}
 dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
 
@@ -257,15 +267,10 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
       </div>
       <div class="wbar">
         <span class="wgrp">
-          <label class="sw" title="只在这段时间里续租">
+          <label class="sw" title="只在这些时间段里续租">
             <input type="checkbox" id="w-on"><i></i>
           </label>
           <span class="wtag">只在时间段内保活</span>
-        </span>
-        <span class="wgrp">
-          <input type="time" id="w-start" value="08:00" step="60">
-          <span class="muted">至</span>
-          <input type="time" id="w-end" value="23:00" step="60">
         </span>
         <span class="wgrp">
           <span class="muted">单次上限</span>
@@ -273,6 +278,11 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
           <span class="muted">分钟（0 = 不限）</span>
         </span>
         <button class="btn tiny primary" id="b-wsave" type="button">保存</button>
+      </div>
+      <div class="wranges" id="w-ranges"></div>
+      <div class="wfoot">
+        <button class="btn tiny" id="b-wadd" type="button">＋ 添加时间段</button>
+        <span class="muted">可加多段，每段之间机器会自然休眠；跨午夜写 22:00 至 06:00</span>
       </div>
       <div class="wstate" id="wstate"></div>
     </section>
@@ -287,7 +297,7 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
           <thead>
             <tr>
               <th>账号</th><th>机器</th><th>状态</th><th>租约</th>
-              <th class="c">保活</th><th class="r">操作</th>
+              <th>区间</th><th class="c">保活</th><th class="r">操作</th>
             </tr>
           </thead>
           <tbody id="mrows"></tbody>
@@ -371,6 +381,31 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
     <div class="row">
       <button class="btn" type="button" id="acct-cancel">取消</button>
       <button class="btn primary" type="submit" id="acct-save">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="mwin" class="modal">
+  <form id="mwin-form" autocomplete="off">
+    <h2 id="mwin-title">机器保活区间</h2>
+    <p class="sub" id="mwin-sub">不自定义时跟随上方的默认区间。</p>
+    <label class="field">
+      <span><input type="checkbox" id="mwin-on"> 只在时间段内保活（不勾选 = 全天）</span>
+    </label>
+    <div class="field">
+      <span>时间段（北京时间，可加多段）</span>
+      <div class="wranges" id="mwin-ranges"></div>
+      <button class="btn tiny" id="mwin-add" type="button">＋ 添加时间段</button>
+    </div>
+    <label class="field">
+      <span>单次保活上限（分钟，0 = 不限）</span>
+      <input type="number" id="mwin-max" min="0" max="1440" step="15" value="0">
+    </label>
+    <p class="err hide" id="mwin-err"></p>
+    <div class="row">
+      <button class="btn" type="button" id="mwin-cancel">取消</button>
+      <button class="btn" type="button" id="mwin-reset">跟随默认</button>
+      <button class="btn primary" type="submit" id="mwin-save">保存</button>
     </div>
   </form>
 </dialog>
@@ -522,12 +557,39 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
       var st = m.state || "unknown";
       var stCls = st === "running" ? "ok" : (st === "suspended" || st === "stopped" ? "warn" : "");
       var r = leftInfo(m.expiresAt);
-      // 冷却中：这时候点「唤醒」一定会被平台拒（409 machine_cooldown），先标出来
+      // 冷却中：这时候点「唤醒」一定会被平台拒（409 machine_cooldown），先标出来。
+      // cooldownReason 是 abuse_* 说明是安全审查锁（最长 24 小时），
+      // 空则是 max-run 到点（5-20 分钟，免费版连坐能到 2 小时）—— 两者提示要分开。
       var cooling = m.cooldownUntil && new Date(m.cooldownUntil).getTime() > Date.now();
-      var cool = cooling
-        ? '<div class="mid muted">冷却中，还剩 ' + esc(leftInfo(m.cooldownUntil).text.replace("后到期", "")) + "</div>"
-        : "";
+      var cool = "";
+      if (cooling) {
+        var abuse = /^abuse_/.test(m.cooldownReason || "");
+        cool = '<div class="mid muted">' + (abuse ? "安全审查锁，还剩 " : "冷却中，还剩 ") +
+          esc(leftInfo(m.cooldownUntil).text.replace("后到期", "")) + "</div>";
+      } else if (m.maxRunMinutes > 0 && m.runStartedAt) {
+        // 免费版 480 分钟到点就会被平台强制暂停，提前把剩余时间摆出来
+        var endMs = new Date(m.runStartedAt).getTime() + m.maxRunMinutes * 60000;
+        if (endMs > Date.now()) {
+          cool = '<div class="mid muted">距 max-run 上限还有 ' +
+            esc(leftInfo(new Date(endMs).toISOString()).text.replace("后到期", "")) + "</div>";
+        }
+      }
       var dis = readOnly ? " disabled" : "";
+      // 区间编辑依赖 CONFIG KV；没有 KV 时只禁用区间按钮，不能连无需 KV 的
+      // 续租/唤醒/释放一起禁用。
+      var winDis = readOnly || !data.canSave ? " disabled" : "";
+      var w = m.window || {};
+      var segs = Array.isArray(w.ranges) ? w.ranges : [];
+      var winText;
+      if (!w.on) winText = "全天";
+      else if (segs.length > 1) winText = segs.length + " 段";
+      else if (segs.length) winText = segs[0].startAt + "–" + segs[0].endAt;
+      else winText = w.startAt + "–" + w.endAt;
+      if (w.maxMin) winText += " · ≤" + w.maxMin + "分";
+      if (w.inherited) winText = "默认 · " + winText;
+      var winCls = w.phase === "idle" || w.phase === "capped" ? "warn" : (w.inherited ? "muted" : "ok");
+      var winCell = '<button class="btn tiny" data-act="mwin" data-a="' + m.account + '" data-id="' + esc(m.id) + '"' + winDis + ">" +
+        esc(winText) + '</button><div class="mid ' + winCls + '">' + esc(w.inherited ? "跟随默认" : "单独设置") + "</div>";
       var ops = '<button class="btn tiny" data-act="renew" data-a="' + m.account + '" data-id="' + esc(m.id) + '"' + dis + ">续租</button>";
       if (st !== "running") {
         ops += '<button class="btn tiny" data-act="resume" data-a="' + m.account + '" data-id="' + esc(m.id) + '"' + dis + ">唤醒</button>";
@@ -539,6 +601,7 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
         '<td><div class="mname">' + esc(m.name) + '</div><div class="mid mono">' + esc(m.id) + "</div></td>" +
         '<td><span class="badge ' + stCls + '">' + esc(st) + "</span>" + cool + "</td>" +
         '<td><span class="left ' + r.cls + '" data-exp="' + esc(m.expiresAt || "") + '">' + esc(r.text) + "</span></td>" +
+        "<td>" + winCell + "</td>" +
         '<td class="c"><label class="sw"><input type="checkbox" data-act="toggle" data-a="' + m.account +
           '" data-id="' + esc(m.id) + '"' + (m.selected ? " checked" : "") + dis + "><i></i></label></td>" +
         '<td class="r">' + ops + "</td>" +
@@ -550,31 +613,94 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
   // 用户动过区间表单但还没保存时，别让 20 秒一次的自动刷新把输入覆盖掉
   var wDirty = false;
 
+  // 多段时间的一行：起点 / 至 / 终点 / 删除。窄屏整行换行，不拆开时间
+  function rangeRow(startAt, endAt) {
+    return '<span class="wrange">' +
+      '<input type="time" class="r-start" value="' + esc(startAt || "08:00") + '" step="60">' +
+      '<span class="muted">至</span>' +
+      '<input type="time" class="r-end" value="' + esc(endAt || "23:00") + '" step="60">' +
+      '<button class="btn tiny danger" type="button" data-del="1">删除</button>' +
+      "</span>";
+  }
+
+  function setRangesDisabled(id, dis) {
+    var box = $(id);
+    if (!box) return;
+    var nodes = box.querySelectorAll("input,button");
+    for (var i = 0; i < nodes.length; i++) nodes[i].disabled = dis;
+  }
+
+  function fillRanges(id, ranges) {
+    var box = $(id);
+    if (!box) return;
+    var list = Array.isArray(ranges) && ranges.length ? ranges : [{ startAt: "08:00", endAt: "23:00" }];
+    box.innerHTML = list.map(function (r) { return rangeRow(r.startAt, r.endAt); }).join("");
+    setRangesDisabled(id, readOnly || !data.canSave);
+  }
+
+  function addRange(id, startAt, endAt) {
+    var box = $(id);
+    if (!box) return;
+    box.insertAdjacentHTML("beforeend", rangeRow(startAt, endAt));
+    setRangesDisabled(id, readOnly || !data.canSave);
+  }
+
+  // 读回所有段；时间非法就退回当前值，避免把 00:00 静默写进去
+  function collectRanges(id, fallback) {
+    var box = $(id);
+    var out = [];
+    if (!box) return out;
+    var rows = box.querySelectorAll(".wrange");
+    var fb = fallback || { start: 480, end: 1380 };
+    for (var i = 0; i < rows.length; i++) {
+      var s = rows[i].querySelector(".r-start");
+      var e = rows[i].querySelector(".r-end");
+      out.push({ start: toMin(s && s.value, fb.start), end: toMin(e && e.value, fb.end) });
+    }
+    return out;
+  }
+
+  function bindRangeBox(id, onDirty) {
+    var box = $(id);
+    if (!box) return;
+    box.addEventListener("click", function (e) {
+      var btn = e.target.closest ? e.target.closest("[data-del]") : null;
+      if (!btn) return;
+      var row = btn.closest(".wrange");
+      if (row) row.remove();
+      // 删光了补回一行：空数组会让后端退回默认，用户会以为「删掉 = 全天」
+      if (!box.querySelectorAll(".wrange").length) addRange(id);
+      if (onDirty) onDirty();
+    });
+    box.addEventListener("input", function () { if (onDirty) onDirty(); });
+  }
+
   function renderWindow() {
     var w = data.window;
     var el = $("wstate");
     if (!w) { el.textContent = ""; return; }
 
+    var dis = readOnly || !data.canSave;
     if (!wDirty) {
       $("w-on").checked = !!w.on;
-      $("w-start").value = w.startAt || "08:00";
-      $("w-end").value = w.endAt || "23:00";
       $("w-max").value = w.maxMin || 0;
+      fillRanges("w-ranges", w.ranges);
+    } else {
+      setRangesDisabled("w-ranges", dis);
     }
 
-    var dis = readOnly || !data.canSave;
     $("w-on").disabled = dis;
-    $("w-start").disabled = dis;
-    $("w-end").disabled = dis;
     $("w-max").disabled = dis;
     $("b-wsave").disabled = dis;
+    $("b-wadd").disabled = dis;
 
     var t = "现在北京时间 " + w.nowAt + " · ";
     var cls = "wstate";
+    var segCount = (w.ranges || []).length;
     if (!w.on) {
       t += w.maxMin ? "全天保活，单次最多 " + w.maxMin + " 分钟" : "全天保活";
     } else if (w.phase === "idle") {
-      t += "不在区间内，cron 不续租，机器会自然休眠";
+      t += "不在区间内（共 " + segCount + " 段），cron 不续租，机器会自然休眠";
       cls += " warn";
     } else if (w.phase === "capped") {
       t += "本轮已保活 " + w.keptMin + " 分钟，到 " + w.maxMin + " 分钟上限了";
@@ -664,6 +790,9 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
     $("app").classList.remove("hide");
     // 没启用登录（没配密码/TOKEN）就不显示退出/账号按钮
     var canAuth = !!(data.auth && data.auth.via !== "open");
+    // renderMachines 依赖这个值决定区间按钮是否可编辑；在 render() 里统一
+    // 由服务端 auth.canWrite 计算，避免读到一个旧的只读状态。
+    readOnly = !!(data.auth && data.auth.canWrite === false);
     $("b-logout").classList.toggle("hide", !canAuth);
     $("b-account").classList.toggle("hide", !canAuth);
     $("pill").textContent = data.paused ? "已暂停" : "运行中";
@@ -689,7 +818,6 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
       n.className = "notice hide";
     }
 
-    readOnly = !!(data.auth && data.auth.canWrite === false);
     $("b-renew").disabled = readOnly;
     $("b-pause").disabled = readOnly;
     $("b-logclear").disabled = readOnly;
@@ -710,6 +838,8 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
 
   function load() {
     if (loading) return;
+    // 弹窗编辑期间不做后台回填；保存后主动 load，用户输入不会被覆盖。
+    if ($("mwin") && $("mwin").open) return;
     loading = true;
     return api("/api/state").then(function (j) {
       loading = false;
@@ -732,6 +862,39 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
     });
   }
 
+  var winTarget = null;
+
+  function findMachine(a, id) {
+    var ms = (data && data.machines) || [];
+    for (var i = 0; i < ms.length; i++) {
+      if (String(ms[i].account) === String(a) && String(ms[i].id) === String(id)) return ms[i];
+    }
+    return null;
+  }
+
+  function openMachineWindow(a, id) {
+    var m = findMachine(a, id);
+    if (!m) { toast("机器已不在列表里，刷新后重试", true); return; }
+    // 弹窗里的区间字段回填“实际生效值”：继承默认时直接展示默认配置，
+    // 用户改前能看见自己将从什么值开始，而不是空白/08:00 的假值。
+    winTarget = { account: Number(a), id: m.id, name: m.name || m.id };
+    var w = m.window || {};
+    $("mwin-title").textContent = (m.name || m.id) + " 的保活区间";
+    $("mwin-sub").textContent = w.inherited
+      ? "当前跟随默认区间；保存后只覆盖这台机器。"
+      : "这台机器使用单独设置；可随时恢复跟随默认。";
+    $("mwin-on").checked = !!w.on;
+    $("mwin-max").value = w.maxMin || 0;
+    fillRanges("mwin-ranges", w.ranges);
+    $("mwin-err").classList.add("hide");
+    $("mwin").showModal();
+  }
+
+  function closeMachineWindow() {
+    winTarget = null;
+    $("mwin").close();
+  }
+
   function saveAccount(a, patch) {
     var body = { accounts: {} };
     body.accounts[String(a)] = patch;
@@ -746,7 +909,8 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
     // - 有面板配置：list 模式取白名单，all 模式取全部
     // - 没面板配置：选中态来自环境变量 INSTABOX_MACHINE，用服务端返回的 selected
     //   若按 all 当基准，取消勾选一台就会把其它本来没保活的机器一起写进白名单。
-    var cur = (acc && acc.conf)
+    // 只配了单机区间时，筛选范围仍由环境变量决定，不能把 all 当成基准。
+    var cur = (acc && acc.conf && !acc.conf.inheritSelection)
       ? (acc.conf.mode === "list" ? acc.conf.machines.slice() : all.slice())
       : list.filter(function (m) { return m.selected; }).map(function (m) { return m.id; });
     // 白名单里可能残留已删除机器的 id，保存前过滤掉
@@ -758,8 +922,11 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
     } else {
       next = cur.filter(function (x) { return x !== id; });
     }
-    if (all.length && next.length >= all.length) { saveAccount(a, { enabled: true, mode: "all" }); return; }
-    saveAccount(a, { enabled: true, mode: "list", machines: next });
+    // skip 是 Telegram 维护的「点名关闭」名单，打开机器时必须一起摘掉，
+    // 否则 mode=all 下即使勾选开关，cron 仍会跳过它。
+    var skip = (acc && acc.conf && Array.isArray(acc.conf.skip) ? acc.conf.skip : []).filter(function (x) { return x !== id; });
+    // 所有分支都显式带 skip：mode:all 若不传 skip，后端会按“未提供”保留旧名单。
+    saveAccount(a, { enabled: true, mode: all.length && next.length >= all.length ? "all" : "list", machines: next, skip: skip });
   }
 
   function machineAction(a, id, action, btn) {
@@ -785,7 +952,9 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
     var a = el.getAttribute("data-a");
     var id = el.getAttribute("data-id");
 
-    if (act === "renew" || act === "resume" || act === "release") {
+    if (act === "mwin") {
+      openMachineWindow(a, id);
+    } else if (act === "renew" || act === "resume" || act === "release") {
       machineAction(a, id, act, el);
     } else if (act === "accall") {
       saveAccount(a, { enabled: true, mode: "all" });
@@ -797,6 +966,12 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
   document.addEventListener("change", function (e) {
     var t = e.target;
     var act = t.getAttribute && t.getAttribute("data-act");
+    // 面板只读或没绑 CONFIG 时别发注定失败的写请求，直接把开关恢复。
+    if ((act === "toggle" || act === "acc") && (readOnly || !data.canSave)) {
+      toast("当前是只读模式，开关不会保存", true);
+      load();
+      return;
+    }
     if (act === "toggle") setMachine(t.getAttribute("data-a"), t.getAttribute("data-id"), t.checked);
     else if (act === "acc") saveAccount(t.getAttribute("data-a"), { enabled: t.checked });
   });
@@ -836,21 +1011,79 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
     return h > 23 || mi > 59 ? fallback : h * 60 + mi;
   }
 
-  ["w-on", "w-start", "w-end", "w-max"].forEach(function (id) {
+  // 默认区间的表单脏标记：时间段是动态行，用事件委托统一监听
+  ["w-on", "w-max"].forEach(function (id) {
     var el = $(id);
     if (!el) return;
     el.addEventListener("input", function () { wDirty = true; });
     el.addEventListener("change", function () { wDirty = true; });
   });
+  bindRangeBox("w-ranges", function () { wDirty = true; });
+  $("b-wadd").addEventListener("click", function () {
+    addRange("w-ranges", "18:00", "23:00");
+    wDirty = true;
+  });
+  $("mwin-add").addEventListener("click", function () {
+    addRange("mwin-ranges", "18:00", "23:00");
+  });
+
+  function machineWindowPatch() {
+    var w = (winTarget && findMachine(winTarget.account, winTarget.id)?.window) || {};
+    var first = (Array.isArray(w.ranges) && w.ranges[0]) || { start: 480, end: 1380 };
+    var maxMin = Math.max(0, Math.min(1440, Number($("mwin-max").value) || 0));
+    return {
+      account: winTarget.account,
+      id: winTarget.id,
+      window: {
+        on: $("mwin-on").checked,
+        ranges: collectRanges("mwin-ranges", { start: first.start, end: first.end }),
+        maxMin: maxMin,
+      },
+    };
+  }
+
+  function submitMachineWindow(body, reset) {
+    var err = $("mwin-err");
+    err.classList.add("hide");
+    var b = $("mwin-save");
+    b.disabled = true;
+    var target = winTarget;
+    api("/api/config", { method: "POST", body: { machine: body } }).then(function (j) {
+      b.disabled = false;
+      if (!j.ok) {
+        err.textContent = j.error || "保存失败";
+        err.classList.remove("hide");
+        return;
+      }
+      closeMachineWindow();
+      toast(reset ? "已恢复跟随默认区间" : "已保存这台机器的区间");
+      load();
+    }).catch(function (e) {
+      b.disabled = false;
+      err.textContent = "请求失败：" + e.message;
+      err.classList.remove("hide");
+    });
+  }
+
+  $("mwin-form").addEventListener("submit", function (e) {
+    e.preventDefault();
+    if (!winTarget) return;
+    submitMachineWindow({ account: winTarget.account, id: winTarget.id, window: machineWindowPatch().window }, false);
+  });
+  $("mwin-cancel").addEventListener("click", closeMachineWindow);
+  $("mwin-reset").addEventListener("click", function () {
+    if (!winTarget) return;
+    submitMachineWindow({ account: winTarget.account, id: winTarget.id, window: null }, true);
+  });
 
   $("b-wsave").addEventListener("click", function () {
     var w = (data && data.window) || {};
+    var first = (Array.isArray(w.ranges) && w.ranges[0]) || { start: 480, end: 1380 };
     var maxMin = Math.max(0, Math.min(1440, Number($("w-max").value) || 0));
     var patch = {
       window: {
         on: $("w-on").checked,
-        start: toMin($("w-start").value, w.start == null ? 480 : w.start),
-        end: toMin($("w-end").value, w.end == null ? 1380 : w.end),
+        ranges: collectRanges("w-ranges", { start: first.start, end: first.end }),
         maxMin: maxMin,
       },
     };
@@ -1449,6 +1682,35 @@ function parseClock(s) {
   return h > 23 || mi > 59 ? -1 : h * 60 + mi;
 }
 
+// "/window" 后面的时间段 + 可选上限：
+//   "09:00-12:00"                        → 一段
+//   "09:00-12:00,14:00-18:00"            → 两段（逗号/顿号/空格都认）
+//   "09:00-12:00 14:00-18:00 120"        → 两段 + 上限 120
+// 末尾纯数字当上限，不会被当成时间；解析不了返回 null（调用方报用法）。
+function parseWindowSpec(s) {
+  let rest = String(s || "").trim();
+  if (!rest) return null;
+  let maxMin;
+  const tail = /(?:\s+|^)(?:max|上限)?\s*(\d{1,4})$/.exec(rest);
+  if (tail) {
+    maxMin = Number(tail[1]);
+    rest = rest.slice(0, tail.index).trim();
+  }
+  if (!rest) return null;
+  const chunks = rest.split(/[,，、;；\s]+/).filter(Boolean);
+  const ranges = [];
+  for (const c of chunks) {
+    const m = /^(\d{1,2}[:：]?\d{2})\s*[-–—~至到]\s*(\d{1,2}[:：]?\d{2})$/.exec(c);
+    if (!m) return null;
+    const start = parseClock(m[1]);
+    const end = parseClock(m[2]);
+    if (start < 0 || end < 0) return null;
+    ranges.push({ start, end });
+  }
+  if (!ranges.length || ranges.length > 8) return null;
+  return { ranges, maxMin };
+}
+
 // 按钮文字有长度上限，机器名太长就截断（id 留在详情页）
 const short = (s, n = 16) => {
   const t = String(s || "");
@@ -1468,10 +1730,11 @@ function headerLines(snap) {
   // 保活区间：开着就显示时段 + 当前在不在里面，一眼看出「为什么没在续租」
   const w = snap.window;
   if (w) {
+    const wl = windowShort(w);
     if (!w.on) lines.push(`区间：全天${w.maxMin ? `（单次上限 ${w.maxMin} 分钟）` : ""}`);
-    else if (w.phase === "idle") lines.push(`区间：${w.startAt}–${w.endAt} · ⏸ 现在区间外（${w.nowAt}）`);
-    else if (w.phase === "capped") lines.push(`区间：${w.startAt}–${w.endAt} · ⏸ 本轮已到 ${w.maxMin} 分钟上限`);
-    else lines.push(`区间：${w.startAt}–${w.endAt} · ▶ 区间内${w.maxMin ? `（已 ${w.keptMin}/${w.maxMin} 分钟）` : ""}`);
+    else if (w.phase === "idle") lines.push(`区间：${wl} · ⏸ 现在区间外（${w.nowAt}）`);
+    else if (w.phase === "capped") lines.push(`区间：${wl} · ⏸ 本轮已到 ${w.maxMin} 分钟上限`);
+    else lines.push(`区间：${wl} · ▶ 区间内${w.maxMin ? `（已 ${w.keptMin}/${w.maxMin} 分钟）` : ""}`);
   }
   if (!snap.canSave) lines.push("⚠️ 没绑 CONFIG KV：保活开关存不下来");
   for (const w of (snap.warnings || []).filter((x) => x && x.error).slice(0, 3)) {
@@ -1496,6 +1759,9 @@ function overview(snap, page) {
     const rest = left(r.expiresAt);
     if (rest) bits.push(`租约 ${rest}`);
     if (!r.selected) bits.push("保活关");
+    if (r.window && !r.window.inherited) {
+      bits.push(`区间 ${windowShort(r.window)}${r.window.maxMin ? ` · ≤${r.window.maxMin}分` : ""}`);
+    }
     // 冷却中：这时候点唤醒是叫不醒的，先在列表里标出来
     if (r.cooldownUntil && new Date(r.cooldownUntil).getTime() > Date.now()) bits.push(`⏳ 冷却 ${left(r.cooldownUntil)}`);
     lines.push(bits.join(" · "));
@@ -1521,7 +1787,7 @@ function overview(snap, page) {
   }
   kb.push(nav);
   // 底部两个常驻入口：区间设置 + 全局暂停。以前「暂停」独占一行，白占高度
-  const wl = snap.window && snap.window.on ? `${snap.window.startAt}–${snap.window.endAt}` : "全天";
+  const wl = windowShort(snap.window);
   kb.push([
     { text: `⏰ 区间 ${wl}`, callback_data: "w:menu" },
     { text: snap.paused ? "▶ 恢复保活" : "⏸ 暂停保活", callback_data: snap.paused ? "p:off" : "p:on" },
@@ -1532,10 +1798,30 @@ function overview(snap, page) {
 
 // ---- 保活区间面板 -------------------------------------------------------------
 
+// 列表里用的短标签：多段写「3 段」，单段写时间，避免一行被撑爆
+function windowShort(w) {
+  if (!w || !w.on) return "全天";
+  const segs = Array.isArray(w.ranges) ? w.ranges : [];
+  if (segs.length > 1) return `${segs.length} 段`;
+  return segs[0] ? `${segs[0].startAt}–${segs[0].endAt}` : "全天";
+}
+
 function windowText(w) {
   if (w.error) return `⚠️ ${esc(w.error)}`;
-  const lines = ["<b>⏰ 保活区间</b>"];
-  lines.push(`时间段：${w.on ? `${w.startAt} – ${w.endAt}` : "关（全天保活）"}`);
+  const isMachine = w.scope === "machine";
+  const lines = [isMachine ? `<b>⏰ ${esc(w.name || w.id)} 的保活区间</b>` : "<b>⏰ 默认保活区间</b>"];
+  if (isMachine) {
+    lines.push(w.inherited ? "当前：跟随默认区间" : "当前：这台机器单独设置");
+  }
+  const segs = Array.isArray(w.ranges) ? w.ranges : [];
+  if (!w.on) {
+    lines.push("时间段：关（全天保活）");
+  } else if (segs.length <= 1) {
+    lines.push(`时间段：${segs[0] ? `${segs[0].startAt} – ${segs[0].endAt}` : "全天"}`);
+  } else {
+    lines.push(`时间段（${segs.length} 段）：`);
+    segs.forEach((r, i) => lines.push(`  ${i + 1}. ${r.startAt} – ${r.endAt}`));
+  }
   lines.push(`单次上限：${w.maxMin ? `${w.maxMin} 分钟` : "不限"}`);
   lines.push("");
   if (w.phase === "idle") {
@@ -1543,37 +1829,73 @@ function windowText(w) {
     lines.push("cron 不会续租，机器会按平台规则自然休眠。");
   } else if (w.phase === "capped") {
     lines.push(`⏸ 本轮已保活 ${w.keptMin} 分钟，到 ${w.maxMin} 分钟上限了`);
-    lines.push("等下一个区间开始会自动重新计时。");
+    lines.push("等下一段开始会自动重新计时。");
   } else {
     lines.push(`▶ 正在保活（北京时间 ${w.nowAt}${w.startedAt ? `，本轮已 ${w.keptMin} 分钟` : ""}）`);
   }
   lines.push("");
   lines.push("时间段按<b>北京时间（UTC+8）</b>算，跨午夜可以写 22:00-06:00。");
-  lines.push("区间外会主动放掉租约，机器随即休眠；手动 /wake 不受区间限制。");
+  lines.push("多段用逗号隔开；区间外会主动放掉租约，机器随即休眠。手动 /wake 不受区间限制。");
+  const example = isMachine
+    ? `/window ${w.name || w.id} 09:00-12:00,14:00-18:00 90`
+    : "/window 09:00-12:00,14:00-18:00 90";
+  lines.push("");
+  lines.push("✍️ 任意时段 + 上限：");
+  lines.push(`<code>${esc(example)}</code>`);
+  lines.push("直接发这条命令即可；下方按钮可以按段增删。");
   return lines.join("\n");
 }
 
-function windowKeyboard(w) {
+function windowKeyboard(w, target = null) {
+  // 机器级回调要带 account:id；默认区间保持旧协议 w:*，兼容已发出的旧消息。
+  const tag = target
+    ? `m:${target.account}:${encodeURIComponent(String(target.id))}`
+    : "d";
+  const cbk = (action, ...args) => cb(["w", tag, action, ...args].join(":"));
   const kb = [];
   kb.push([
     w.on
-      ? { text: "🔕 关掉时间段（改成全天）", callback_data: "w:off" }
-      : { text: "🔔 打开时间段", callback_data: "w:on" },
+      ? { text: "🔕 关掉时间段（改成全天）", callback_data: cbk("off") }
+      : { text: "🔔 打开时间段", callback_data: cbk("on") },
   ]);
+
+  const segs = Array.isArray(w.ranges) ? w.ranges : [];
+  // 每段一个删除按钮，两个一行；编号和正文里的列表一一对应
+  if (w.on && segs.length) {
+    for (let i = 0; i < segs.length; i += 2) {
+      const row = [];
+      for (let j = i; j < Math.min(i + 2, segs.length); j++) {
+        row.push({ text: `🗑 删 ${j + 1}`, callback_data: cbk("del", j) });
+      }
+      kb.push(row);
+    }
+  }
+  // 常用段直接追加，不覆盖已有的（想整体替换用 /window 命令）
+  if (segs.length < 8) {
+    kb.push([
+      { text: "＋ 09:00–12:00", callback_data: cbk("add", 540, 720) },
+      { text: "＋ 14:00–18:00", callback_data: cbk("add", 840, 1080) },
+    ]);
+    kb.push([
+      { text: "＋ 22:00–06:00", callback_data: cbk("add", 1320, 360) },
+      { text: "＋ 全天", callback_data: cbk("add", 0, 0) },
+    ]);
+  }
   kb.push([
-    { text: "08:00–23:00", callback_data: "w:pre:480:1380" },
-    { text: "09:00–18:00", callback_data: "w:pre:540:1080" },
+    { text: "上限 2h", callback_data: cbk("max", 120) },
+    { text: "上限 4h", callback_data: cbk("max", 240) },
+    { text: "不限", callback_data: cbk("max", 0) },
   ]);
-  kb.push([
-    { text: "22:00–06:00", callback_data: "w:pre:1320:360" },
-    { text: "全天", callback_data: "w:pre:0:0" },
-  ]);
-  kb.push([
-    { text: "上限 2h", callback_data: "w:max:120" },
-    { text: "上限 4h", callback_data: "w:max:240" },
-    { text: "不限", callback_data: "w:max:0" },
-  ]);
-  kb.push([{ text: "↩ 返回机器列表", callback_data: "l:0" }]);
+  kb.push([{ text: "✍️ 任意时段", callback_data: cbk("custom") }]);
+  if (target) {
+    kb.push([{ text: "↩ 恢复跟随默认区间", callback_data: cbk("reset") }]);
+    kb.push([
+      { text: "↩ 机器详情", callback_data: cb(`d:${target.account}:${target.id}`) },
+      { text: "📋 机器列表", callback_data: "l:0" },
+    ]);
+  } else {
+    kb.push([{ text: "↩ 返回机器列表", callback_data: "l:0" }]);
+  }
   return { inline_keyboard: kb };
 }
 
@@ -1584,13 +1906,25 @@ function detail(row) {
     `状态：${icon(row.state)} ${stateText(row.state)}`,
     row.expiresAt ? `租约：${left(row.expiresAt)} 后到期` : "租约：无",
     `保活：${row.selected ? "✅ 开" : "🔕 关"}`,
+    `区间：${row.window ? row.window.label : "跟随默认"}${row.window && row.window.inherited ? "（默认）" : ""}`,
   ];
   // 冷却中：平台在让机器休息（max-run 到点或安全审查锁住），这时候叫也叫不醒，
-  // 提前写出来，省得用户反复点「唤醒」以为坏了
+  // 提前写出来，省得用户反复点「唤醒」以为坏了。cooldownReason 是 abuse_* 时
+  // 是安全审查锁（最长 24 小时），和 max-run 冷却不是一回事，文案要分开。
   const cool = row.cooldownUntil ? left(row.cooldownUntil) : "";
-  if (cool && cool !== "已过期") lines.push(`冷却：还要 ${cool} 才能唤醒（平台限制）`);
+  if (cool && cool !== "已过期") {
+    const abuse = /^abuse_/.test(row.cooldownReason || "");
+    lines.push(
+      abuse
+        ? `🔒 安全审查锁：还要 ${cool} 才能唤醒（最长 24 小时，平台限制）`
+        : `⏳ 冷却：还要 ${cool} 才能唤醒（max-run 到点，平台限制）`,
+    );
+  }
   if (Number.isFinite(row.maxRunMinutes) && row.maxRunMinutes > 0) {
-    lines.push(`最长运行：${row.maxRunMinutes} 分钟`);
+    const started = Date.parse(row.runStartedAt || "");
+    const endMs = started ? started + row.maxRunMinutes * 60000 : 0;
+    const rest = endMs > Date.now() ? left(new Date(endMs).toISOString()) : "";
+    lines.push(`最长运行：${row.maxRunMinutes} 分钟${rest ? `（本轮还剩 ${rest}）` : ""}`);
   }
   const kb = {
     inline_keyboard: [
@@ -1609,6 +1943,7 @@ function detail(row) {
         },
         { text: "🗑 放租约", callback_data: cb(`a:release:${row.account}:${row.id}`) },
       ],
+      [{ text: "⏰ 这台机器的区间", callback_data: cb(`w:m:${row.account}:${encodeURIComponent(String(row.id))}`) }],
       [{ text: "↩ 返回列表", callback_data: cb("l:0") }],
     ],
   };
@@ -1616,21 +1951,65 @@ function detail(row) {
 }
 
 // ---- 保活开关（CONFIG 的 skip 名单）-------------------------------------------
-// 不动 mode/machines：mode=all 的账号加一条 skip 就够，以后新建的机器照样被保活。
-async function setSkip(tg, c, account, id, skip) {
+// 只由机器人写 skip 时，账号条目仍要跟随环境变量的机器筛选。
+const tgBlankAccountConfig = () => ({
+  enabled: true,
+  mode: "all",
+  machines: [],
+  skip: [],
+  inheritSelection: true,
+  windows: {},
+});
+
+// 设置某台机器的“实际保活选中态”。
+// - 打开：从 skip 移除；若账号是 list 模式且机器不在白名单，则加入白名单
+// - 关闭：加入 skip；list 模式下同时从白名单移除
+// 这样 /keep、详情页按钮、Web API 回读的不是两套互相矛盾的状态。
+async function setKeepEnabled(tg, c, account, id, enabled, machineName = "") {
   if (!c.cfgKv) {
     return { ok: false, error: "没绑 CONFIG KV，保活开关存不下来（cron 下一轮可能把机器叫醒）" };
   }
   const { conf, error } = await tg.loadConfig(c);
   if (error) return { ok: false, error };
   const key = String(account);
-  const prev = conf.accounts[key] || { enabled: true, mode: "all", machines: [], skip: [] };
-  const set = new Set(Array.isArray(prev.skip) ? prev.skip : []);
-  if (skip) set.add(id);
-  else set.delete(id);
-  conf.accounts[key] = { ...prev, skip: [...set] };
+  const isNew = !conf.accounts[key];
+  const prev = conf.accounts[key] || tgBlankAccountConfig();
+  const skip = new Set(Array.isArray(prev.skip) ? prev.skip : []);
+  let mode = prev.mode === "list" ? "list" : "all";
+  let machines = Array.isArray(prev.machines) ? [...prev.machines] : [];
+  let inheritSelection = prev.inheritSelection === true;
+
+  if (enabled) {
+    skip.delete(id);
+    // 账号级停用优先于单机开关；打开机器必须同时恢复账号，否则回执成功但 cron 仍跳过。
+    if (prev.enabled === false) prev.enabled = true;
+    const acc = c.accounts.find((x) => x.account === Number(account));
+    const envPicked = Array.isArray(acc?.machine) ? acc.machine : [];
+    const coveredByEnv =
+      !envPicked.length || envPicked.includes(id) || (machineName && envPicked.includes(machineName));
+    if (inheritSelection && !coveredByEnv) {
+      // 环境变量已排除这台机器：把当前 env 白名单和本机物化成 list，避免“打开”是空操作。
+      mode = "list";
+      machines = [...new Set([...envPicked.filter((x) => x && x !== "all" && x !== "*"), id])];
+      inheritSelection = false;
+    } else if (mode === "list" && !machines.includes(id)) {
+      machines.push(id);
+    }
+  } else {
+    skip.add(id);
+    if (mode === "list") machines = machines.filter((x) => x !== id);
+  }
+
+  const next = { ...prev, mode, machines, skip: [...skip], inheritSelection };
+  if (isNew) next.inheritSelection = inheritSelection;
+  conf.accounts[key] = next;
   await tg.saveConfig(c, conf);
   return { ok: true };
+}
+
+// 保留旧名字，避免漏掉已有调用点；语义与 setKeepEnabled 完全一致。
+async function setSkip(tg, c, account, id, skip, machineName = "") {
+  return setKeepEnabled(tg, c, account, id, !skip, machineName);
 }
 
 async function setPaused(tg, c, paused) {
@@ -1648,7 +2027,7 @@ const accOf = (c, n) => c.accounts.find((a) => a.account === Number(n)) || null;
 
 async function wakeMachine(tg, c, acc, id, name) {
   // 先把保活摘回来：否则 cron 那头还当我们不要它，醒来又被挂起
-  const sk = await setSkip(tg, c, acc.account, id, false);
+  const sk = await setSkip(tg, c, acc.account, id, false, name);
   const fast = { ...acc, wakeTries: WAKE_TRIES_BOT, wakeGap: WAKE_GAP_BOT };
   const out = await tg.wakeThenLease(fast, { id, name });
   const note = sk.ok ? "" : `\n⚠️ 保活没打开：${esc(sk.error)}`;
@@ -1681,7 +2060,7 @@ async function shutMachine(tg, c, acc, id, name, mode) {
 
   // 顺序很重要：先关保活，再动机器。反过来的话 cron 可能正好在两件事中间
   // 看到机器被挂起，一路 resume 回来，看起来像「关了又自己开了」。
-  const sk = await setSkip(tg, c, acc.account, id, true);
+  const sk = await setSkip(tg, c, acc.account, id, true, name);
   const note = sk.ok ? "" : `\n⚠️ 保活没关掉（cron 可能会把它叫醒）：${esc(sk.error)}`;
 
   const already = mode === "suspend" ? st === "suspended" || st === "stopped" : st === "stopped";
@@ -1741,25 +2120,16 @@ async function doAction(tg, c, action, account, id, name) {
       return `✅ <b>${esc(label)}</b> 租约已释放（到点就会空闲休眠）`;
     }
     case "keepon": {
-      const r = await setSkip(tg, c, acc.account, id, false);
+      const r = await setSkip(tg, c, acc.account, id, false, label);
       return r.ok ? `✅ <b>${esc(label)}</b> 保活已打开` : `⚠️ ${esc(r.error)}`;
     }
     case "keepoff": {
-      const r = await setSkip(tg, c, acc.account, id, true);
+      const r = await setSkip(tg, c, acc.account, id, true, label);
       return r.ok ? `✅ <b>${esc(label)}</b> 保活已关掉（机器本身不动）` : `⚠️ ${esc(r.error)}`;
     }
     default:
       return `未知操作：${esc(action)}`;
   }
-}
-
-// ---- 命令解析 -----------------------------------------------------------------
-
-function parseCommand(text) {
-  const t = String(text || "").trim();
-  const m = /^\/([A-Za-z0-9_]+)(?:@\S+)?(?:\s+([\s\S]*))?$/.exec(t);
-  if (!m) return null;
-  return { cmd: m[1].toLowerCase(), args: (m[2] || "").trim() };
 }
 
 // 按名字或 id 找机器；同名多台全返回（多账号下常见）
@@ -1772,6 +2142,15 @@ function pickTargets(snap, wanted) {
   return snap.machines.filter((m) => String(m.name || "").toLowerCase() === low);
 }
 
+// ---- 命令解析 -----------------------------------------------------------------
+
+function parseCommand(text) {
+  const t = String(text || "").trim();
+  const m = /^\/([A-Za-z0-9_]+)(?:@\S+)?(?:\s+([\s\S]*))?$/.exec(t);
+  if (!m) return null;
+  return { cmd: m[1].toLowerCase(), args: (m[2] || "").trim() };
+}
+
 const HELP = [
   "<b>InstaBox 机器管理</b>",
   "",
@@ -1782,7 +2161,9 @@ const HELP = [
   "/renew 名字 — 手动续一次租约",
   "/release 名字 — 放掉租约",
   "/keep 名字 on|off — 只切保活，不动机器",
-  "/window — 保活区间（时间段 + 单次上限）",
+  "/window — 默认保活区间（时间段 + 单次上限）",
+  "/window 09:00-12:00,14:00-18:00 90 — 多段 + 上限",
+  "/window 机器名 09:15-17:45 90 — 只给这台机器设",
   "/pause on|off — 全局暂停/恢复保活",
   "/id — 看本聊天 id",
   "",
@@ -1796,7 +2177,7 @@ const BOT_COMMANDS = [
   { command: "wake", description: "唤醒机器并续租" },
   { command: "sleep", description: "休眠机器（保留内存）" },
   { command: "stop", description: "关机（下次冷启动）" },
-  { command: "window", description: "保活区间：时间段 + 单次上限" },
+  { command: "window", description: "自定义时段/上限（默认或指定机器）" },
   { command: "keep", description: "开关某台机器的保活" },
   { command: "renew", description: "手动续一次租约" },
   { command: "pause", description: "全局暂停 / 恢复保活" },
@@ -1854,53 +2235,89 @@ async function onMessage(conf, c, tg, message) {
   }
 
   if (p.cmd === "window" || p.cmd === "win" || p.cmd === "区间") {
-    const a = p.args.trim();
-    let patch = null;
+    let target = null;
+    let args = p.args.trim();
+    let snap = null;
 
-    if (!a) {
+    // 第一个词是机器名/id 就进入单机区间；否则保持原来的全局默认命令。
+    // reset 在单机模式下删除覆盖，在默认模式下把默认恢复为全天。
+    if (args && !/^(on|off|开|关|打开|关闭|max|上限|reset|默认|恢复默认)\b/i.test(args) && !/^\d{1,2}[:：]?\d{2}\s*[-–—~至到]/.test(args)) {
+      snap = await tg.state(c);
+      const m = /^(\S+)(?:\s+([\s\S]*))?$/.exec(args);
+      const hits = m ? pickTargets(snap, m[1]) : [];
+      if (!hits.length) {
+        await send(conf.token, chatId, `找不到机器 ${esc(m ? m[1] : args)}。发 /ls 看看有哪些。`);
+        return;
+      }
+      if (hits.length > 1) {
+        await send(conf.token, chatId, `${esc(m[1])} 对应 ${hits.length} 台机器，请改发机器 id：\n` + hits.map((x) => `· #${x.account} <code>${esc(x.id)}</code>`).join("\n"));
+        return;
+      }
+      target = { account: hits[0].account, id: hits[0].id, name: hits[0].name || hits[0].id };
+      args = (m[2] || "").trim();
+    }
+
+    let patch = null;
+    let reset = false;
+    if (!args) {
       // 无参 = 看设置
-    } else if (/^(off|关|关掉|关闭)$/i.test(a)) {
+    } else if (/^(reset|默认|恢复默认)$/i.test(args)) {
+      if (target) reset = true;
+      else patch = { on: false, ranges: [{ start: 0, end: 0 }], maxMin: 0 };
+    } else if (/^(off|关|关掉|关闭)$/i.test(args)) {
       patch = { on: false };
-    } else if (/^(on|开|打开)$/i.test(a)) {
+    } else if (/^(on|开|打开)$/i.test(args)) {
       patch = { on: true };
     } else {
-      const mx = /^(?:max|上限)\s*(\d{1,4})$/i.exec(a);
-      const rng = /^(\d{1,2}[:：]?\d{2})\s*[-–—~至到]\s*(\d{1,2}[:：]?\d{2})$/.exec(a);
+      const mx = /^(?:max|上限)\s*(\d{1,4})$/i.exec(args);
       if (mx) {
-        patch = { maxMin: Math.min(1440, Number(mx[1])) };
-      } else if (rng) {
-        const s = parseClock(rng[1]);
-        const e = parseClock(rng[2]);
-        if (s < 0 || e < 0) {
-          await send(conf.token, chatId, "时间要写成 <code>08:00-23:00</code> 这种格式。");
+        const maxMin = Number(mx[1]);
+        if (!Number.isInteger(maxMin) || maxMin < 0 || maxMin > 1440) {
+          await send(conf.token, chatId, "单次上限必须在 <code>0-1440</code> 分钟之间，0 = 不限。");
           return;
         }
-        patch = { on: true, start: s, end: e };
+        patch = { maxMin };
       } else {
-        await send(
-          conf.token,
-          chatId,
-          [
-            "用法：",
-            "<code>/window</code> 看当前设置",
-            "<code>/window 08:00-23:00</code> 设时间段并打开",
-            "<code>/window on</code> / <code>/window off</code> 开关时间段",
-            "<code>/window max 180</code> 单次最长保活 180 分钟（0 = 不限）",
-          ].join("\n"),
-        );
-        return;
+        // 支持多段：逗号/顿号/空格分隔，末尾可带上限
+        const spec = parseWindowSpec(args);
+        if (!spec) {
+          await send(
+            conf.token,
+            chatId,
+            [
+              "用法：",
+              "<code>/window</code> 看默认区间",
+              "<code>/window 08:00-23:00</code> 设默认时间段并打开",
+              "<code>/window 09:00-12:00,14:00-18:00</code> 设多段（逗号/空格分隔都行）",
+              "<code>/window 09:15-17:45 90</code> 任意时段 + 单次上限 90 分钟",
+              "<code>/window on</code> / <code>/window off</code> 开关默认时间段",
+              "<code>/window max 180</code> 默认单次上限 180 分钟（0 = 不限）",
+              "<code>/window 机器名</code> 看这台机器的区间",
+              "<code>/window 机器名 09:00-12:00,14:00-18:00 90</code> 只给这台机器设多段",
+              "<code>/window 机器名 max 120</code> 只改这台机器的上限",
+              "<code>/window 机器名 reset</code> 恢复跟随默认",
+            ].join("\n"),
+          );
+          return;
+        }
+        if (spec.maxMin !== undefined && (spec.maxMin < 0 || spec.maxMin > 1440)) {
+          await send(conf.token, chatId, "单次上限必须在 <code>0-1440</code> 分钟之间，0 = 不限。");
+          return;
+        }
+        patch = { on: true, ranges: spec.ranges };
+        if (spec.maxMin !== undefined) patch.maxMin = spec.maxMin;
       }
     }
 
-    if (patch) {
-      const r = await tg.patchWindow(c, patch);
+    if (patch || reset) {
+      const r = await tg.patchWindow(c, patch, target, { reset });
       if (!r.ok) {
         await send(conf.token, chatId, `⚠️ ${esc(r.error)}`);
         return;
       }
     }
-    const w = await tg.windowInfo(c);
-    await send(conf.token, chatId, windowText(w), windowKeyboard(w));
+    const w = await tg.windowInfo(c, target);
+    await send(conf.token, chatId, windowText(w), windowKeyboard(w, target));
     return;
   }
 
@@ -2021,24 +2438,117 @@ async function onCallback(conf, c, tg, query) {
   }
 
   if (kind === "w") {
-    const sub = parts[1];
+    let target = null;
+    let sub = "";
+    // 新协议 d:on / d:pre:... ；机器协议 m:account:encodedId:on|pre|max|reset
+    if (parts[1] === "d") {
+      sub = parts[2] || "";
+    } else if (parts[1] === "m") {
+      const account = Number(parts[2]);
+      // 回调查询来自外部输入，decodeURIComponent 遇到坏转义会抛异常；
+      // Telegram 会重投失败的 update，这里先变成可控的「参数不对」。
+      let id = "";
+      try {
+        id = decodeURIComponent(parts[3] || "");
+      } catch {
+        await edit("机器参数不对，发 /ls 重新打开。");
+        return;
+      }
+      if (!Number.isSafeInteger(account) || !id) {
+        await edit("机器参数不对，发 /ls 重新打开。");
+        return;
+      }
+      target = { account, id };
+      sub = parts[4] || "";
+    } else {
+      // 兼容旧消息：w:on / w:off / w:pre:s:e / w:max:n / w:menu
+      sub = parts[1] || "menu";
+    }
+
+    const base = parts[1] === "d" ? 2 : parts[1] === "m" ? 4 : 1;
     let patch = null;
+    let reset = false;
     if (sub === "on") patch = { on: true };
     else if (sub === "off") patch = { on: false };
-    else if (sub === "pre") patch = { on: true, start: Number(parts[2]), end: Number(parts[3]) };
-    else if (sub === "max") patch = { maxMin: Number(parts[2]) };
+    else if (sub === "pre") {
+      const sMin = Number(parts[base + 1]);
+      const eMin = Number(parts[base + 2]);
+      if (!Number.isFinite(sMin) || !Number.isFinite(eMin)) {
+        await edit("区间参数不对，重新打开面板再试。");
+        return;
+      }
+      // 老消息里的预设按钮：整体替换成这一段（多段的增删走 add / del）
+      patch = { on: true, ranges: [{ start: Math.max(0, Math.min(1439, sMin)), end: Math.max(0, Math.min(1439, eMin)) }] };
+    } else if (sub === "add" || sub === "del") {
+      const cur = await tg.windowInfo(c, target);
+      if (cur.error) {
+        await edit(`⚠️ ${esc(cur.error)}`);
+        return;
+      }
+      const ranges = (cur.ranges || []).map((r) => ({ start: r.start, end: r.end }));
+      if (sub === "add") {
+        const sMin = Number(parts[base + 1]);
+        const eMin = Number(parts[base + 2]);
+        if (!Number.isInteger(sMin) || !Number.isInteger(eMin) || sMin < 0 || sMin > 1439 || eMin < 0 || eMin > 1439) {
+          await edit("区间参数不对，重新打开面板再试。");
+          return;
+        }
+        ranges.push({ start: sMin, end: eMin });
+        patch = { on: true, ranges };
+      } else {
+        const idx = Number(parts[base + 1]);
+        if (!Number.isInteger(idx) || idx < 0 || idx >= ranges.length) {
+          await edit("这一段已经不在了，重新打开面板。");
+          return;
+        }
+        ranges.splice(idx, 1);
+        // 删光了就退回默认一段（后端也会兜底，这里先保持语义清楚）
+        patch = { ranges: ranges.length ? ranges : [{ start: 480, end: 1380 }] };
+      }
+    } else if (sub === "max") {
+      const maxMin = Number(parts[base + 1]);
+      if (!Number.isInteger(maxMin) || maxMin < 0 || maxMin > 1440) {
+        await edit("上限参数必须是 0-1440 分钟，重新打开面板再试。");
+        return;
+      }
+      patch = { maxMin };
+    } else if (sub === "reset") {
+      reset = true;
+    }
 
-    if (!patch) {
-      // w:menu —— 只是打开区间面板
-      const w = await tg.windowInfo(c);
-      await edit(windowText(w), windowKeyboard(w));
+    if (target && !target.name) {
+      const snap = await tg.state(c);
+      const row = findRow(snap, target.account, target.id);
+      target.name = row?.name || target.id;
+    }
+
+    if (sub === "custom") {
+      const usage = target
+        ? `/window ${target.name || target.id} 09:15-17:45 90`
+        : "/window 09:15-17:45 90";
+      const subtitle = target ? `${esc(target.name || target.id)} 的` : "默认";
+      const w = await tg.windowInfo(c, target);
+      await edit(
+        `<b>✍️ 自定义${subtitle}保活区间</b>\n\n` +
+          `发送下面格式，时间和上限都可自由填写：\n<code>${esc(usage)}</code>\n\n` +
+          "时间按北京时间，支持跨午夜；最后的分钟数可省略，省略时保留当前上限。",
+        windowKeyboard(w, target),
+      );
       return;
     }
 
-    const r = await tg.patchWindow(c, patch);
-    const w = await tg.windowInfo(c);
+    if (!patch && !reset) {
+      // w:menu 或 w:d:menu —— 只是打开区间面板
+      const w = await tg.windowInfo(c, target);
+      await edit(windowText(w), windowKeyboard(w, target));
+      return;
+    }
+
+    const r = await tg.patchWindow(c, patch, target, { reset });
+    // target 在默认区间分支为 null；machine 分支由回调参数构造，不能引用未定义变量。
+    const w = await tg.windowInfo(c, target);
     const head = r.ok ? "" : `⚠️ ${esc(r.error)}\n\n`;
-    await edit(head + windowText(w), windowKeyboard(w));
+    await edit(head + windowText(w), windowKeyboard(w, target));
     return;
   }
 
@@ -2177,7 +2687,7 @@ async function telegramAdmin(env, url, conf = tgConfig(env)) {
 const API_DEFAULT = "https://api.instabox.sh";
 const LEASE_DEFAULT = "keepalive";
 const TTL_DEFAULT = 300;
-const VERSION = "2.2";
+const VERSION = "2.3";
 
 const LOG_KEY = "log";
 const CONFIG_KEY = "config";
@@ -2379,12 +2889,19 @@ function resolve(c, name) {
 // 以后新建的机器默认不保活。加一层 skip 就两边都照顾到了。
 function blankConfig() {
   return {
-    v: 1,
+    v: 2,
     paused: false,
     window: { on: false, start: 480, end: 1380, maxMin: 0 },
     telegram: null,
     accounts: {},
   };
+}
+
+// 账号配置。inheritSelection 为 true 表示这只是一条「机器区间/暂停」记录，机器筛选仍跟随
+// INSTABOX_MACHINE；否则以 mode/machines 为准。这样只给一台机器设区间时，不会
+// 意外把原本用环境变量限定的一批机器改成「全部保活」。
+function blankAccountConfig() {
+  return { enabled: true, mode: "all", machines: [], skip: [], inheritSelection: false, windows: {} };
 }
 
 // Telegram 机器人的配置。存在 CONFIG 里是为了让「网页面板直接配 bot」成为可能：
@@ -2403,26 +2920,75 @@ function normalizeTelegram(raw) {
 }
 
 // 保活区间：只在这段时间里续租，其余时间放掉租约让机器按平台规则休眠。
-//   on     时间段开关（关掉 = 全天保活，只受 maxMin 约束）
-//   start  开始，当天第几分钟（480 = 08:00）；start > end 表示跨午夜
-//   end    结束，同一套算法；start === end 表示全天
-//   maxMin 单次最长保活分钟数，0 = 不限。从「进入区间」那一刻开始算
+//   on      时间段开关（关掉 = 全天保活，只受 maxMin 约束）
+//   ranges  时间段列表，每段 { start, end }，都是「当天第几分钟」（480 = 08:00）
+//           一段里 start > end 表示跨午夜；start === end 表示这一段就是全天
+//           （旧数据只有 { start, end } 时自动当成单段，不用迁移）
+//   maxMin  单次最长保活分钟数，0 = 不限。每进入一段重新计时
 // 时间一律按北京时间（UTC+8）解释：Worker 内部跑 UTC，换算在这里做。
 const BJT_OFFSET_MIN = 480;
+// 一天最多 8 段：再多就该用 cron 表达式了，面板和 Telegram 也放不下
+const MAX_RANGES = 8;
 
 function clampMin(value, fallback) {
   const n = Number.parseInt(value, 10);
   return Number.isFinite(n) && n >= 0 && n < 1440 ? n : fallback;
 }
 
+function normalizeRange(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const start = clampMin(raw.start, NaN);
+  const end = clampMin(raw.end, NaN);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+  return { start, end };
+}
+
+// 接受数组（新）或单个 { start, end }（旧），去重后按起点排序。
+// 空 / 全非法时退回默认的 08:00–23:00，绝不返回空数组 —— 空数组会让
+// inWindow 永远 false，机器就再也不保活了。
+function normalizeRanges(raw) {
+  const list = Array.isArray(raw) ? raw : raw && typeof raw === "object" ? [raw] : [];
+  const out = [];
+  const seen = new Set();
+  for (const item of list) {
+    const r = normalizeRange(item);
+    if (!r) continue;
+    const key = `${r.start}-${r.end}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(r);
+    if (out.length >= MAX_RANGES) break;
+  }
+  out.sort((a, b) => a.start - b.start || a.end - b.end);
+  return out.length ? out : [{ start: 480, end: 1380 }];
+}
+
 function normalizeWindow(raw) {
-  const out = { on: false, start: 480, end: 1380, maxMin: 0 };
+  const out = { on: false, ranges: [{ start: 480, end: 1380 }], maxMin: 0 };
   if (!raw || typeof raw !== "object") return out;
   out.on = raw.on === true;
-  out.start = clampMin(raw.start, out.start);
-  out.end = clampMin(raw.end, out.end);
+  out.ranges = normalizeRanges(raw.ranges ?? raw);
   const m = Number.parseInt(raw.maxMin, 10);
   if (Number.isFinite(m) && m >= 0) out.maxMin = Math.min(m, 1440);
+  return out;
+}
+
+// 机器 id 会作为 KV 对象键；拦住空值、超长值和原型相关保留字。
+function validMachineId(raw) {
+  const id = String(raw || "").trim();
+  return id.length > 0 && id.length <= 128 && id !== "__proto__" && id !== "prototype" && id !== "constructor";
+}
+
+// 每台机器的区间覆盖：windows[machineId] = { on, start, end, maxMin }。
+// 键缺失 = 继承 config.window 的账号默认值。机器 id 只接受接口实际返回的字符串，
+// 顺手拦住空/超长键，避免把坏数据永久写进 KV。
+function normalizeMachineWindows(raw) {
+  const out = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [id, value] of Object.entries(raw)) {
+    if (!validMachineId(id) || !value || typeof value !== "object") continue;
+    out[String(id).trim()] = normalizeWindow(value);
+  }
   return out;
 }
 
@@ -2435,17 +3001,32 @@ function bjMinute(now = new Date()) {
 const hhmm = (min) => `${String(Math.floor(min / 60)).padStart(2, "0")}:${String(min % 60).padStart(2, "0")}`;
 
 function windowLabel(w) {
-  if (!w || !w.on) return w && w.maxMin ? `全天（单次上限 ${w.maxMin} 分钟）` : "全天";
-  const span = w.start === w.end ? "全天" : `${hhmm(w.start)}–${hhmm(w.end)}`;
-  return w.maxMin ? `${span}（单次上限 ${w.maxMin} 分钟）` : span;
+  const maxMin = w && w.maxMin ? `（单次上限 ${w.maxMin} 分钟）` : "";
+  if (!w || !w.on) return `全天${maxMin}`;
+  const ranges = normalizeRanges(w.ranges);
+  const allDay = ranges.length === 1 && ranges[0].start === ranges[0].end;
+  const span = allDay ? "全天" : ranges.map((r) => `${hhmm(r.start)}–${hhmm(r.end)}`).join("、");
+  return `${span}${maxMin}`;
 }
 
-// 现在在不在保活区间里。没开时间段就永远算「在」。
+// 单段命中判断。start === end 当作全天。
+function rangeHit(r, minute) {
+  if (r.start === r.end) return true;
+  return r.start < r.end ? minute >= r.start && minute < r.end : minute >= r.start || minute < r.end;
+}
+
+// 现在落在哪一段里；没开时间段返回 null（由 inWindow 单独放行）。
+function currentRange(w, now = new Date()) {
+  if (!w || !w.on) return null;
+  const m = bjMinute(now);
+  const hit = normalizeRanges(w.ranges).find((r) => rangeHit(r, m));
+  return hit ? { ...hit, allDay: hit.start === hit.end } : null;
+}
+
+// 现在在不在保活区间里（任意一段命中即可）。没开时间段就永远算「在」。
 function inWindow(w, now = new Date()) {
   if (!w || !w.on) return true;
-  if (w.start === w.end) return true;
-  const m = bjMinute(now);
-  return w.start < w.end ? m >= w.start && m < w.end : m >= w.start || m < w.end;
+  return currentRange(w, now) !== null;
 }
 
 function normalizeConfig(raw) {
@@ -2467,6 +3048,8 @@ function normalizeConfig(raw) {
       mode,
       machines: mode === "list" ? machines : [],
       skip: skip.filter((id) => !(mode === "list" && machines.includes(id))),
+      inheritSelection: v.inheritSelection === true,
+      windows: normalizeMachineWindows(v.windows),
     };
   }
   return out;
@@ -2510,86 +3093,258 @@ const accountConf = (conf, n) => conf.accounts[String(n)] || null;
 const WIN_KEY = "win";
 const winMemo = new Map();
 
+function blankWinEntry() {
+  return { phase: "keep", startedAt: null, at: null, seg: "" };
+}
+
+function normalizeWinEntry(raw) {
+  const out = blankWinEntry();
+  if (!raw || typeof raw !== "object") return out;
+  const phase = String(raw.phase || "keep");
+  out.phase = phase === "idle" || phase === "capped" ? phase : "keep";
+  out.startedAt = raw.startedAt ? String(raw.startedAt) : null;
+  out.at = raw.at ? String(raw.at) : null;
+  // 当前在第几段（"480-720" / "all"）：换段要重新计时，得跨 cron 轮次记住
+  out.seg = raw.seg ? String(raw.seg) : "";
+  if (raw.source === "machine" || raw.source === "default") out.source = raw.source;
+  return out;
+}
+
+function normalizeWinState(raw) {
+  const out = normalizeWinEntry(raw);
+  out.machines = {};
+  const src = raw && typeof raw === "object" && raw.machines && typeof raw.machines === "object" ? raw.machines : {};
+  for (const [key, value] of Object.entries(src)) {
+    if (!key || key.length > 200 || !value || typeof value !== "object") continue;
+    out.machines[key] = normalizeWinEntry(value);
+  }
+  return out;
+}
+
+const winMachineKey = (account, id) => `${account}:${id}`;
+
+function winEntryFor(state, account, id, fallback = false) {
+  const key = winMachineKey(account, id);
+  if (state.machines[key]) return state.machines[key];
+  return fallback ? normalizeWinEntry(state) : blankWinEntry();
+}
+
+function setWinEntry(state, account, id, entry) {
+  state.machines[winMachineKey(account, id)] = normalizeWinEntry(entry);
+}
+
+// 只比较会影响调度结果的字段，忽略观测时间 at，避免每轮 cron 白写一次 KV。
+function winFingerprint(state) {
+  return JSON.stringify({
+    phase: state.phase,
+    startedAt: state.startedAt,
+    machines: Object.entries(state.machines)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, v]) => [key, v.phase, v.startedAt, v.seg || "", v.source || ""]),
+  });
+}
+
 async function loadWinState(c) {
-  const blank = { phase: "keep", startedAt: null, at: null };
-  if (!c.cfgKv) return winMemo.get("state") || blank;
+  if (!c.cfgKv) return normalizeWinState(winMemo.get("state"));
   try {
     const v = JSON.parse((await c.cfgKv.get(WIN_KEY)) || "null");
-    if (!v || typeof v !== "object") return blank;
-    return { phase: String(v.phase || "keep"), startedAt: v.startedAt || null, at: v.at || null };
+    return normalizeWinState(v);
   } catch {
-    return blank;
+    return normalizeWinState(null);
   }
 }
 
 async function saveWinState(c, v) {
+  const next = normalizeWinState(v);
   if (!c.cfgKv) {
-    winMemo.set("state", v);
+    winMemo.set("state", next);
     return;
   }
   try {
-    await c.cfgKv.put(WIN_KEY, JSON.stringify(v), { expirationTtl: 604800 });
+    // 只有默认区间状态、没有任何机器状态时删掉键，保持旧部署的 win 键形态。
+    if (!Object.keys(next.machines).length && next.phase === "keep" && !next.startedAt) {
+      await c.cfgKv.delete(WIN_KEY);
+    } else {
+      await c.cfgKv.put(WIN_KEY, JSON.stringify(next), { expirationTtl: 604800 });
+    }
   } catch {}
 }
 
-// 算这一轮该不该保活。返回 { phase, startedAt, inWindow, limitMin, over }
-//   idle   —— 不在时间段内
-//   capped —— 在时间段内，但单次保活已经用满 maxMin
-//   keep   —— 正常保活
-function winPhase(conf, st, now) {
-  const w = conf.window || normalizeWindow(null);
-  if (!inWindow(w, new Date(now))) {
-    return { phase: "idle", startedAt: null, inWindow: false, limitMin: w.maxMin || 0, over: false };
+// 改配置后只清掉受影响的计时：
+//   machine —— 一台机器
+//   account —— 整个账号
+//   default —— 所有继承默认区间的机器（显式自定义的保持不动）
+async function resetWinState(c, opts = {}) {
+  if (!c.cfgKv) {
+    winMemo.delete("state");
+    return;
   }
-  // 刚从区间外进来（或第一次跑）→ 重新计时
-  const fresh = st.phase === "idle" || !st.startedAt;
+  const state = await loadWinState(c);
+  if (opts.account != null && opts.id != null) {
+    delete state.machines[winMachineKey(opts.account, opts.id)];
+  } else if (opts.account != null) {
+    const prefix = `${opts.account}:`;
+    for (const key of Object.keys(state.machines)) if (key.startsWith(prefix)) delete state.machines[key];
+  } else if (opts.default === true) {
+    state.phase = "keep";
+    state.startedAt = null;
+    for (const key of Object.keys(state.machines)) {
+      const cut = key.indexOf(":");
+      if (cut < 0) continue;
+      const account = key.slice(0, cut);
+      const id = key.slice(cut + 1);
+      const ac = opts.conf ? accountConf(opts.conf, account) : null;
+      if (!ac || !ac.windows || !ac.windows[id]) delete state.machines[key];
+    }
+  } else {
+    winMemo.delete("state");
+    return;
+  }
+  // 只清目标机器的状态时，没有可清的就别写 KV；清默认窗口则必须落盘，
+  // 否则面板仍会读到已失效的 startedAt。
+  if (opts.default !== true && (!state.machines || !Object.keys(state.machines).length)) return;
+  await saveWinState(c, state);
+}
+
+// 算这一轮该不该保活。返回 { phase, startedAt, inWindow, limitMin, over, seg }
+//   idle   —— 不在任何一段时间段内
+//   capped —— 在某段内，但这一段的保活已经用满 maxMin
+//   keep   —— 正常保活
+function winPhase(window, st, now) {
+  const w = normalizeWindow(window);
+  // 没开时间段：永远 keep，seg 固定 "all"（不参与换段重置）
+  const cur = w.on ? currentRange(w, new Date(now)) : { start: 0, end: 0, allDay: true };
+  if (!cur) {
+    return { phase: "idle", startedAt: null, inWindow: false, limitMin: w.maxMin || 0, over: false, seg: "" };
+  }
+  // seg 是「现在在第几段」的标识：换段要重新计时（中间机器已经休眠过一轮），
+  // 同一段内 capped 不能重置，否则下一轮会把已触顶的计时重新开始，上限失效。
+  // 旧状态没有 seg（单段时代的 KV 数据），当作「同段」处理，避免升级后立刻误重置。
+  const seg = cur.allDay ? "all" : `${cur.start}-${cur.end}`;
+  const fresh = st.phase === "idle" || !st.startedAt || (!!st.seg && String(st.seg) !== seg);
   const startedAt = fresh ? new Date(now).toISOString() : st.startedAt;
   const limitMin = w.maxMin || 0;
   const over = limitMin > 0 && now - new Date(startedAt).getTime() >= limitMin * 60000;
-  return { phase: over ? "capped" : "keep", startedAt, inWindow: true, limitMin, over };
+  return { phase: over ? "capped" : "keep", startedAt, inWindow: true, limitMin, over, seg };
 }
 
-// 给面板 / 机器人看的一屏信息
-function windowView(conf, ph, st) {
-  const w = conf.window || normalizeWindow(null);
+// 给面板 / 机器人看的一屏信息。meta 用来区分默认区间和某台机器的覆盖区间。
+function windowView(window, ph, st, meta = {}) {
+  const w = normalizeWindow(window);
+  const ranges = w.ranges.map((r) => ({ start: r.start, end: r.end, startAt: hhmm(r.start), endAt: hhmm(r.end) }));
   return {
     on: !!w.on,
-    start: w.start,
-    end: w.end,
+    ranges,
+    // start/end 是老字段：保留第一段的起止，旧前端/旧测试不至于炸
+    start: ranges[0].start,
+    end: ranges[0].end,
     maxMin: w.maxMin || 0,
-    startAt: hhmm(w.start),
-    endAt: hhmm(w.end),
+    startAt: ranges[0].startAt,
+    endAt: ranges[0].endAt,
     label: windowLabel(w),
     phase: ph.phase,
     inWindow: ph.inWindow,
+    seg: ph.seg || "",
     startedAt: ph.startedAt,
     keptMin: ph.startedAt ? Math.max(0, Math.round((Date.now() - new Date(ph.startedAt).getTime()) / 60000)) : 0,
     nowAt: hhmm(bjMinute()),
     tz: "UTC+8",
+    ...meta,
   };
 }
 
-// 机器人 / 面板用：只读区间状态，不列机器（省子请求）
-async function windowInfo(c) {
+// 机器没有覆盖项时继承账号默认窗口。
+function effectiveWindow(conf, account, id) {
+  const ac = accountConf(conf, account);
+  const own = ac && ac.windows ? ac.windows[id] : null;
+  return own ? { window: own, inherited: false } : { window: conf.window, inherited: true };
+}
+
+// 把最新配置里的覆盖关系应用到 win 状态上：
+// 已改成自定义/继承另一种来源的机器，旧计时不能继续沿用，否则会立刻误触顶。
+// 纯内存计算，cron 每轮都能安全调用。
+function reconcileWinState(conf, state) {
+  for (const [key, entry] of Object.entries(state.machines)) {
+    const cut = key.indexOf(":");
+    if (cut < 0) continue;
+    const account = key.slice(0, cut);
+    const id = key.slice(cut + 1);
+    const ac = accountConf(conf, account);
+    const own = ac && ac.windows ? ac.windows[id] : null;
+    if (!own) continue;
+    // 机器窗口出现/变化时，patchWindow/updateConfig 已经精确清过对应计时。
+    // 这里不能再按 source 删：同一账号里一台自定义、一台继承默认时，
+    // 继承那台首次运行时会把没有 source 的自定义机器状态一并误删。
+    entry.source = "machine";
+  }
+}
+
+
+// target = { account, id, name? }：查看某台机器；不传就是默认区间。
+async function windowInfo(c, target = null) {
   const { conf, error } = await loadConfig(c);
   if (error) return { error };
   const st = await loadWinState(c);
-  return windowView(conf, winPhase(conf, st, Date.now()), st);
+  reconcileWinState(conf, st);
+  const now = Date.now();
+  if (target) {
+    const account = Number.parseInt(target.account, 10);
+    const id = String(target.id || "");
+    if (!Number.isSafeInteger(account) || account < 1 || !id) return { error: "机器参数不对" };
+    const eff = effectiveWindow(conf, account, id);
+    const entry = winEntryFor(st, account, id);
+    return windowView(eff.window, winPhase(eff.window, entry, now), entry, {
+      scope: "machine",
+      account,
+      id,
+      name: String(target.name || ""),
+      inherited: eff.inherited,
+      source: eff.inherited ? "default" : "machine",
+    });
+  }
+  return windowView(conf.window, winPhase(conf.window, st, now), st, { scope: "default" });
 }
 
-// 改区间。走和 /api/config 同一套 normalize，非法值会被收敛回默认。
-async function patchWindow(c, patch) {
+// 改区间。target 为空改账号默认；传机器则只覆盖那一台。
+// reset=true 删除机器覆盖，回到默认区间。
+async function patchWindow(c, patch, target = null, opts = {}) {
   if (!c.cfgKv) return { ok: false, error: "没绑 CONFIG KV，区间存不下来" };
   const { conf, error } = await loadConfig(c);
   if (error) return { ok: false, error };
-  conf.window = normalizeWindow({ ...conf.window, ...patch });
+
+  if (!target) {
+    conf.window = normalizeWindow({ ...conf.window, ...(patch || {}) });
+    await saveConfig(c, conf);
+    await resetWinState(c, { default: true, conf });
+    return { ok: true, window: conf.window, scope: "default" };
+  }
+
+  const account = Number.parseInt(target.account, 10);
+  let id = String(target.id || "").trim();
+  if (!Number.isSafeInteger(account) || account < 1) return { ok: false, error: "账号编号不对" };
+  if (!validMachineId(id)) return { ok: false, error: "机器 id 不对" };
+  id = String(id).trim();
+
+  const key = String(account);
+  const isNew = !conf.accounts[key];
+  const ac = conf.accounts[key] || blankAccountConfig();
+  if (!ac.windows) ac.windows = {};
+  const eff = effectiveWindow(conf, account, id);
+  if (opts.reset === true) {
+    // 从未设置过覆盖的机器恢复默认应是无操作，不能凭空创建账号条目。
+    if (isNew || !ac.windows[id]) {
+      return { ok: true, window: eff.window, scope: "machine", account, id, inherited: true, unchanged: true };
+    }
+    delete ac.windows[id];
+  } else {
+    ac.windows[id] = normalizeWindow({ ...eff.window, ...(patch || {}) });
+  }
+  if (isNew) ac.inheritSelection = true;
+  conf.accounts[key] = ac;
   await saveConfig(c, conf);
-  // 区间变了就把运行状态清掉，否则旧的 startedAt 会让新的单次上限立刻触顶
-  try {
-    await c.cfgKv.delete(WIN_KEY);
-  } catch {}
-  winMemo.delete("state");
-  return { ok: true, window: conf.window };
+  await resetWinState(c, { account, id });
+  const after = effectiveWindow(conf, account, id);
+  return { ok: true, window: after.window, scope: "machine", account, id, inherited: after.inherited };
 }
 
 // 这台机器该不该保活：没配条目 = 全保（沿用环境变量行为）
@@ -2606,10 +3361,15 @@ function selected(ac, id) {
 // 否则设了 machine=qqq 的用户会看到所有机器都是开着；在面板里取消勾选时，前端会
 // 以“当前选中集合”为基准写白名单，进而把原本没在保活的机器一起写进去。
 function selectedFor(ac, acc, m) {
-  if (ac) return selected(ac, m.id);
+  // 只设了机器区间时，筛选范围仍以 INSTABOX_MACHINE 为准；否则面板会误把
+  // 环境变量排除的机器也显示成已选，release 时更会误放租约。
+  if (ac && ac.enabled === false) return false;
+  if (ac && Array.isArray(ac.skip) && ac.skip.includes(m.id)) return false;
+  if (ac && ac.inheritSelection !== true) return ac.mode === "list" ? ac.machines.includes(m.id) : true;
   if (!acc.machine.length) return true;
   return acc.machine.includes(m.id) || acc.machine.includes(m.name);
 }
+
 
 // 子请求预算：免费版一次调用最多 50 个外部请求，超了整轮会被平台掐断。
 // 每发一个请求扣一格，扣光就让调用方提前收手（返回一个明确错误，而不是抛异常）。
@@ -2635,13 +3395,20 @@ function timeoutSignal(ms) {
 // operationId 指向「正在这台机器上跑的那个操作」—— 撞上它时等它比盲重试准。
 function errInfo(r) {
   const e = r && r.json && r.json.error;
-  if (!e || typeof e !== "object") return { code: "", retryable: false, after: 0, opId: "" };
+  if (!e || typeof e !== "object") {
+    return { code: "", reason: "", retryable: false, after: 0, opId: "", message: "" };
+  }
   const after = Number(e.retryAfterSeconds);
   return {
     code: String(e.code || ""),
+    // machine_cooldown 的 reason 区分「max-run 到点」和「安全审查锁住」：
+    // 后者最长 24 小时（abuse_egress_blocklist / abuse_network_flows / abuse_cpu），
+    // 前者只有 5-20 分钟（免费版连坐能到 2 小时）。提示文案差很多，得分开。
+    reason: String(e.reason || ""),
     retryable: e.retryable === true,
     after: Number.isFinite(after) && after > 0 ? after : 0,
     opId: String(e.operationId || ""),
+    message: String(e.message || ""),
   };
 }
 
@@ -2659,7 +3426,9 @@ const isCooling = (r) => r.status === 409 && errInfo(r).code === COOLDOWN_CODE;
 
 // 秒数说人话：冷却 5-20 分钟、免费版连坐能到 2 小时
 function fmtDur(sec) {
-  const s = Math.max(0, Math.round(Number(sec) || 0));
+  const raw = Number(sec) || 0;
+  if (raw > 0 && raw < 1) return "不到 1 秒";
+  const s = Math.max(0, Math.round(raw));
   if (s < 60) return `${s} 秒`;
   const m = Math.round(s / 60);
   if (m < 60) return `${m} 分钟`;
@@ -2671,9 +3440,17 @@ function fmtDur(sec) {
 // 等不起就留给下一轮 —— 下一轮只有几分钟，比把这次拖死强。
 const MAX_BACKOFF_MS = 5000;
 
+// 官方对 operation_conflict 的 retryable 写的是 "sometimes"：另一个操作正在跑时
+// 等它跑完就能重试，但「这个状态下不允许这么改」时重试多少次都一样。响应体里明确
+// 写了 retryable: false 就别再打了；没写（或没有 JSON 体）就按可重试处理，保持老行为。
+const explicitNoRetry = (r) => !!(r && r.json && r.json.error && r.json.error.retryable === false);
+
 function isTransient(r) {
   if (r.status === 429 || r.status >= 500) return true;
-  if (r.status === 409) return TRANSIENT_409.has(errInfo(r).code);
+  if (r.status === 409) {
+    if (!TRANSIENT_409.has(errInfo(r).code)) return false;
+    return !explicitNoRetry(r);
+  }
   return false;
 }
 
@@ -2965,11 +3742,11 @@ async function sendAlert(c, text) {
   }
 }
 
-// 冷却中的机器不是故障：平台在让它休息（max-run 到点，或安全审查锁住）。
-// 它们会让这一轮 ok=false，但不该按「保活挂了」去告警 —— 否则免费版每天跑满
-// 8 小时后会连着几小时每 30 分钟弹一条，真正的故障反而被淹掉。
-const coolingOf = (out) => (out.machines || []).filter((m) => m.cooling);
-const hardFailsOf = (out) => (out.machines || []).filter((m) => (m.ok === false || m.error) && !m.cooling);
+// 平台限制不是故障：冷却（max-run 到点 / 安全审查锁）、启动限流（429）、
+// 免费额度用完（402）。它们会让这一轮 ok=false，但不该按「保活挂了」去告警 ——
+// 否则免费版每天跑满 8 小时后会连着几小时每 30 分钟弹一条，真正的故障反而被淹掉。
+const limitedOf = (out) => (out.machines || []).filter((m) => m.limit);
+const hardFailsOf = (out) => (out.machines || []).filter((m) => (m.ok === false || m.error) && !m.limit);
 
 function failText(out, fails) {
   const lines = [`[InstaBox 保活失败] ${alertStamp()}`];
@@ -2982,11 +3759,13 @@ function failText(out, fails) {
     }
     if (bad.length > 8) lines.push(`…还有 ${bad.length - 8} 台`);
   }
-  const cooling = coolingOf(out);
-  if (cooling.length) {
-    lines.push(`${cooling.length} 台在冷却（平台限制，会自己恢复）：`);
-    for (const m of cooling.slice(0, 4)) {
-      lines.push(`· #${m.account} ${m.machine || m.id}${m.cooling ? `，约 ${fmtDur(m.cooling)}后` : ""}`);
+  const limited = limitedOf(out);
+  if (limited.length) {
+    lines.push(`${limited.length} 台受平台限制（会自己恢复）：`);
+    for (const m of limited.slice(0, 4)) {
+      const tag = m.limit === "abuse" ? "安全审查锁" : m.limit === "throttled" ? "启动限流" : "冷却";
+      const left = m.cooling || m.retryAfter;
+      lines.push(`· #${m.account} ${m.machine || m.id} ${tag}${left ? `，约 ${fmtDur(left)}后` : ""}`);
     }
   }
   for (const a of out.accounts || []) if (a.error) lines.push(`· #${a.account}：${a.error}`);
@@ -3003,10 +3782,10 @@ async function notify(c, out) {
   const prev = await loadAlert(c);
   const now = Date.now();
 
-  // 只有冷却、没有别的故障：这不是保活坏了，是平台在让机器休息。
-  // 不报警，也不发「已恢复」，只把连续失败计数清掉（否则冷却结束后的
+  // 只有平台限制、没有别的故障：这不是保活坏了，是平台在让机器休息或限流。
+  // 不报警，也不发「已恢复」，只把连续失败计数清掉（否则限制结束后的
   // 第一条真实故障会被「已连续失败 N 次」的旧计数误导）。
-  if (coolingOf(out).length && !hardFailsOf(out).length && !out.error) {
+  if (limitedOf(out).length && !hardFailsOf(out).length && !out.error) {
     if (prev.state === "fail" || prev.fails) await saveAlert(c, { state: "ok", fails: 0, sentAt: prev.sentAt || 0 });
     return;
   }
@@ -3045,9 +3824,13 @@ const rnd = () => Math.random().toString(36).slice(2, 8);
 
 // 换状态的写操作要 Idempotency-Key（缺了 400）。key 带毫秒时间戳 + 随机串：
 // 同一秒内重试也不会撞到上一次的 key（撞了会拿到缓存的旧响应，看起来像成功了）。
-// 重试时复用同一个 key，让服务端能正确去重。重试次数和 call() 对齐（首次 + 2 次）。
+const newIdemKey = (type, id) => `ka-${type}-${id}-${Date.now()}-${rnd()}`;
+
 async function act(c, id, type) {
-  const key = `ka-${type}-${id}-${Date.now()}-${rnd()}`;
+  let key = newIdemKey(type, id);
+  // /wake 是同步等唤醒的（官方：最多 45 秒），15 秒的通用超时会把慢启动误判成失败。
+  // resume/start 只回 202 + operation，几百毫秒就返回，不用放宽。
+  const timeoutMs = type === "wake" ? 48000 : 15000;
   let last = { ok: false, status: 0, json: null, text: "" };
   for (let i = 0; i <= 2; i++) {
     if (!spend(c)) return { ok: false, status: 0, json: null, text: "子请求预算用完，跳过唤醒" };
@@ -3055,7 +3838,7 @@ async function act(c, id, type) {
       const res = await fetch(`${c.api}/v1/machines/${encodeURIComponent(id)}/${encodeURIComponent(type)}`, {
         method: "POST",
         headers: { "X-API-Key": c.key, "Idempotency-Key": key },
-        signal: timeoutSignal(15000),
+        signal: timeoutSignal(timeoutMs),
       });
       const text = await res.text();
       let json = null;
@@ -3065,6 +3848,10 @@ async function act(c, id, type) {
       last = { ok: res.ok, status: res.status, json, text };
       // 换状态时撞上 operation_conflict 很常见（上一轮的 resume 还没跑完），同样要重试
       if (!isTransient(last)) return last;
+      // 官方对 operation_conflict 的要求是「等那个操作结束后用**新的** Idempotency-Key
+      // 重试」。复用同一个 key 有可能拿回第一次那份 409 的缓存响应，看起来像一直失败。
+      // 429 / 5xx 重试的是同一个请求，复用 key 才符合幂等语义，不动。
+      if (errInfo(last).code === "operation_conflict") key = newIdemKey(type, id);
     } catch (e) {
       last = { ok: false, status: 0, json: null, text: String(e.message || e) };
     }
@@ -3126,17 +3913,61 @@ const leaseAfterWake = async (c, id, wake) => {
 };
 
 // 冷却中不是故障：平台在让机器休息（max-run 到点或安全审查锁住），叫也叫不醒
+// machine_cooldown 有两种来源，提示差很多：
+//   · 没有 reason        → max-run 到点，5-20 分钟（免费版连坐 60-75、120-135）
+//   · reason=abuse_*     → 安全审查锁住，最长 24 小时，只能等或申诉
+const ABUSE_REASON = {
+  abuse_egress_blocklist: "出站黑名单",
+  abuse_network_flows: "网络扫描/攻击流量",
+  abuse_cpu: "CPU 挖矿",
+};
+
 const coolingResult = (r, wake) => {
-  const after = errInfo(r).after;
+  const info = errInfo(r);
+  const after = info.after;
+  const abuse = /^abuse_/.test(info.reason);
+  const why = abuse ? `被安全审查锁住（${ABUSE_REASON[info.reason] || info.reason}）` : "在冷却中（max-run 到点）";
   return {
     ok: false,
     resumed: false,
     cooling: after || 0,
+    limit: abuse ? "abuse" : "cooling",
+    reason: info.reason,
     status: 409,
-    error: after ? `机器在冷却，约 ${fmtDur(after)}后可唤醒（平台限制，不是故障）` : "机器在冷却，平台暂不让唤醒",
+    error: after
+      ? `机器${why}，约 ${fmtDur(after)}后可唤醒（平台限制，不是故障）`
+      : `机器${why}，平台暂不让唤醒`,
     wake,
   };
 };
+
+// 429 rate_limited：平台的启动限流（免费版每分钟 3 次 create/start/resume/wake）。
+// 多台机器同时被挂起时一轮 cron 会撞上，等一分钟就好 —— 不是保活坏了。
+const throttledResult = (r, wake) => {
+  const after = errInfo(r).after;
+  return {
+    ok: false,
+    resumed: false,
+    limit: "throttled",
+    retryAfter: after || 0,
+    status: 429,
+    error: after
+      ? `平台启动限流（每分钟有上限），约 ${fmtDur(after)}后可再试`
+      : "平台启动限流（每分钟有上限），下一轮再试",
+    wake,
+  };
+};
+
+// 402 early_allowance_ended：免费额度用完了，启动被拒。这个不会自己好，
+// 得腾一台机器出来（暂停或删除）或者升级套餐，所以要单独说出来。
+const blockedResult = (r, wake) => ({
+  ok: false,
+  resumed: false,
+  limit: "blocked",
+  status: 402,
+  error: "免费额度已用完，这台启动被拒（402 early_allowance_ended）：先暂停/删除一台机器，或升级套餐",
+  wake,
+});
 
 // 响应是 202 + operation，还是 200 + machine，决定要不要等
 const isOperation = (j) => typeof j?.id === "string" && j.id.startsWith("op_");
@@ -3153,6 +3984,17 @@ async function wakeThenLease(c, m, depth = 0) {
   // 上一轮的唤醒刚好生效了
   if (state === "running") return leaseAfterWake(c, id, ["already-running"]);
 
+  // 正在删 / 已删：叫醒它没有意义，直接说清楚，别白打 resume/start
+  if (state === "deleting" || state === "deleted") {
+    return {
+      ok: false,
+      resumed: false,
+      status: 410,
+      error: `机器正在${state === "deleting" ? "删除" : "已删除"}，唤醒没有意义`,
+      wake: [`state:${state}`],
+    };
+  }
+
   // 平台正在变状态：等它自己走完（机器对象上带着当前 operationId）
   if (["starting", "stopping", "suspending", "resuming", "creating"].includes(state)) {
     const w = await waitOp(c, info.operationId, wakeWaitMs(c));
@@ -3166,7 +4008,9 @@ async function wakeThenLease(c, m, depth = 0) {
   }
 
   const autoPaused = state === "suspended" && !!info.autoSuspendedAt;
-  const order = autoPaused ? ["wake"] : state === "stopped" ? ["start"] : ["resume", "start"];
+  // error 状态下 resume 一定 409（它没在跑），只有冷启动可能把它救回来，
+  // 所以别走 ["resume","start"] 白打一次，直接 start，并把平台给的原因带上。
+  const order = autoPaused ? ["wake"] : state === "stopped" || state === "error" ? ["start"] : ["resume", "start"];
 
   let last = { ok: false, status: 0, text: "" };
   for (const type of order) {
@@ -3192,6 +4036,8 @@ async function wakeThenLease(c, m, depth = 0) {
     }
 
     if (isCooling(a)) return coolingResult(a, wake);
+    if (a.status === 429) return throttledResult(a, wake);
+    if (a.status === 402) return blockedResult(a, wake);
 
     // 别的操作正在这台机器上跑：错误体里带着 operationId，等它比盲重试准。
     // 等完重新评估一次（它可能正是那个把它挂起的操作）。
@@ -3214,7 +4060,7 @@ const noMachine = (acc) =>
   acc.machine.length ? `找不到机器 ${acc.machine.join("、")}（或 key 没权限）` : "这把 key 名下没有机器";
 
 // 一个账号：把它的机器按配置续一遍；单台失败不影响同账号其它机器
-async function keepaliveAccount(acc, conf) {
+async function keepaliveAccount(c, acc, conf) {
   const ac = accountConf(conf, acc.account);
   const base = { account: acc.account, lease: acc.lease, ttl: acc.ttl };
 
@@ -3222,12 +4068,14 @@ async function keepaliveAccount(acc, conf) {
     return { ...base, ok: true, skipped: "已在面板停用这个账号", machines: [] };
   }
 
-  // 面板给这个账号配过东西 → 以面板为准，列出全部机器再按勾选过滤；没配过 → 沿用环境变量
-  const { list, missing, error } = await machines(acc, { ignoreFilter: !!ac });
+  // 只设了机器区间（inheritSelection）→ 机器筛选仍由 INSTABOX_MACHINE 决定；
+  // 真正改过勾选/账号开关 → 以面板为准，列出全部机器再过滤。
+  const panelSelection = !!ac && !ac.inheritSelection;
+  const { list, missing, error } = await machines(acc, { ignoreFilter: panelSelection });
   if (error) return { ...base, ok: false, error, machines: [] };
   if (!list.length) return { ...base, ok: false, error: noMachine(acc), machines: [] };
 
-  const targets = list.filter((m) => selected(ac, m.id));
+  const targets = list.filter((m) => selectedFor(ac, acc, m));
   if (!targets.length) {
     return { ...base, ok: true, skipped: "面板里没有勾选要保活的机器", machines: [] };
   }
@@ -3235,6 +4083,63 @@ async function keepaliveAccount(acc, conf) {
   const results = [];
   for (const m of targets) {
     const item = { machine: m.name, id: m.id };
+    // 逐机器判断区间；手动触发（force）时跳过时间限制，但仍然记录状态。
+    const eff = effectiveWindow(conf, acc.account, m.id);
+    // 继承默认区间的机器若还没有自己的状态，沿用旧版顶层状态里的 startedAt。
+    // 但本机显式配置过窗口时不能复用默认计时，否则新的 maxMin 可能立刻触顶。
+    const own = accountConf(conf, acc.account)?.windows?.[m.id];
+    let prev = winEntryFor(conf._winState, acc.account, m.id, eff.inherited && !own);
+    // 旧版只记了顶层 phase（没有逐机器 startedAt）；刚滑出区间时顶层仍是 keep，
+    // 这一轮仍要释放旧租约，之后各机器状态会自行进入 idle，不会重复释放。
+    const legacyKeeping = eff.inherited && !own && conf._winState.phase === "keep";
+    const ph = winPhase(eff.window, prev, Date.now());
+    if (!conf._force && ph.phase !== "keep") {
+      const now = Date.now();
+      if (prev.phase === "keep" || legacyKeeping) {
+        try {
+          const released = await call(
+            acc,
+            "DELETE",
+            `/v1/machines/${encodeURIComponent(m.id)}/activity-leases/${encodeURIComponent(acc.lease)}`,
+          );
+          if (released.ok || released.status === 404) {
+            await clearLive(c, [{ account: acc.account, id: m.id, name: m.name }]);
+          }
+        } catch (e) {
+          console.log("instabox-keepalive: 区间外放租约失败", e.message);
+        }
+      }
+      const entry = {
+        phase: ph.phase,
+        startedAt: ph.startedAt,
+        seg: ph.seg,
+        at: new Date(now).toISOString(),
+        source: eff.inherited ? "default" : "machine",
+      };
+      setWinEntry(conf._winState, acc.account, m.id, entry);
+      results.push({
+        ...item,
+        ok: true,
+        skipped: ph.phase === "idle" ? `不在保活区间（${windowLabel(eff.window)}）` : `已用满 ${ph.limitMin} 分钟上限`,
+        window: windowView(eff.window, ph, entry, { scope: "machine", account: acc.account, id: m.id, inherited: eff.inherited }),
+      });
+      continue;
+    }
+    if (prev.phase !== ph.phase || prev.startedAt !== ph.startedAt || String(prev.seg || "") !== ph.seg) {
+      setWinEntry(conf._winState, acc.account, m.id, {
+        phase: ph.phase,
+        startedAt: ph.startedAt,
+        seg: ph.seg,
+        at: new Date().toISOString(),
+        source: eff.inherited ? "default" : "machine",
+      });
+    }
+    item.window = windowView(eff.window, ph, winEntryFor(conf._winState, acc.account, m.id), {
+      scope: "machine",
+      account: acc.account,
+      id: m.id,
+      inherited: eff.inherited,
+    });
     // 续租本身 1-2 个请求（含一次重试）；连这个都不够就只能跳过
     if (acc.budget && acc.budget.left < 2) {
       results.push({ ...item, ok: false, error: "子请求预算不够，本轮先跳过（下一轮继续）" });
@@ -3247,6 +4152,12 @@ async function keepaliveAccount(acc, conf) {
       } else if (isCooling(r)) {
         // 平台让机器休息（max-run 到点 / 安全审查锁住）：等多少秒它说了算，别硬顶
         results.push({ ...item, ...coolingResult(r, []) });
+      } else if (r.status === 429) {
+        // 启动限流（免费版每分钟 3 次）：下一轮就好，不是保活坏了
+        results.push({ ...item, ...throttledResult(r, []) });
+      } else if (r.status === 402) {
+        // 免费额度用完，启动被拒：不会自己好，得腾一台机器或升级
+        results.push({ ...item, ...blockedResult(r, []) });
       } else if (acc.autoResume && isNotRunning(r)) {
         // 被挂起了：续租是空转，先把它弄醒再续。
         // 但唤醒要花掉最多 WAKE_COST 个请求，预算不够就别开这个头 ——
@@ -3287,54 +4198,25 @@ async function keepalive(c, opts = {}) {
     return { ok: true, paused: true, at: new Date().toISOString(), count: 0, accounts: [], machines: [] };
   }
 
-  // ---- 保活区间 --------------------------------------------------------------
-  // 手动触发（面板「全部续租」/ 机器人 /wake）不受区间限制：人就在旁边按的，
-  // 按下去就该生效。只有 cron 那一轮才看区间。
-  const now = Date.now();
-  const prevWin = await loadWinState(c);
-  const ph = winPhase(conf, prevWin, now);
-  if (!opts.force) {
-    if (ph.phase !== "keep") {
-      // 刚离开区间（或刚触顶）的那一轮：主动把租约放掉，别让机器干等 TTL 过期。
-      // 只在这一轮做一次 —— 否则每 5 分钟一个 DELETE，纯浪费。
-      if (prevWin.phase !== ph.phase && prevWin.phase === "keep") {
-        try {
-          await release(c, opts.account);
-        } catch (e) {
-          console.log("instabox-keepalive: 区间外放租约失败", e.message);
-        }
-      }
-      if (prevWin.phase !== ph.phase || prevWin.startedAt !== ph.startedAt) {
-        await saveWinState(c, { phase: ph.phase, startedAt: ph.startedAt, at: new Date(now).toISOString() });
-      }
-      const why =
-        ph.phase === "idle"
-          ? `不在保活区间（${windowLabel(conf.window)}，现在 ${hhmm(bjMinute())}）`
-          : `本轮保活已用满 ${ph.limitMin} 分钟上限（从 ${hhmm(bjMinute(new Date(ph.startedAt)))} 算起）`;
-      return {
-        ok: true,
-        skipped: why,
-        window: windowView(conf, ph, prevWin),
-        at: new Date(now).toISOString(),
-        count: 0,
-        accounts: [],
-        machines: [],
-      };
-    }
-    if (prevWin.phase !== "keep" || prevWin.startedAt !== ph.startedAt) {
-      await saveWinState(c, { phase: "keep", startedAt: ph.startedAt, at: new Date(now).toISOString() });
-    }
-  }
-
+  // 保活区间在 keepaliveAccount 里逐机器判断。这样同一轮里一台出区间、
+  // 另一台仍可续租；手动触发（force）跳过时间限制，但不跳过机器/账号开关。
+  const winState = await loadWinState(c);
+  reconcileWinState(conf, winState);
+  // 保留旧版顶层 win 状态（默认区间聚合），兼容已有部署、脚本和测试。
+  // 不能先改它：旧部署要靠原来的 keep 判断「这一轮是否刚滑出区间」。
+  const defaultPrev = normalizeWinEntry(winState);
+  const winBefore = winFingerprint(winState);
   const { picked, error } = resolve(c, opts.account);
   if (error) {
     return { ok: false, at: new Date().toISOString(), error, count: 0, accounts: [], machines: [] };
   }
 
   const accounts = [];
+  // winState/_force 是本次调用的临时上下文，不写入配置序列化结果。
+  const runConf = { ...conf, _winState: winState, _force: !!opts.force };
   for (const acc of picked) {
     try {
-      accounts.push(await keepaliveAccount(acc, conf));
+      accounts.push(await keepaliveAccount(c, acc, runConf));
     } catch (e) {
       // 一个账号的异常不能拖垮其它账号
       accounts.push({ account: acc.account, lease: acc.lease, ttl: acc.ttl, ok: false, error: `续租异常：${e.message}`, machines: [] });
@@ -3357,6 +4239,13 @@ async function keepalive(c, opts = {}) {
     })),
     machines: flat,
   };
+  const defaultPhase = winPhase(conf.window, defaultPrev, Date.now());
+  winState.phase = defaultPhase.phase;
+  winState.startedAt = defaultPhase.startedAt;
+  if (winFingerprint(winState) !== winBefore) {
+    winState.at = new Date().toISOString();
+    await saveWinState(c, winState);
+  }
   await logEvent(c, out, opts.forceLog);
   await recordLive(c, out);
   return out;
@@ -3427,7 +4316,7 @@ async function release(c, account) {
         accounts.push({ account: acc.account, ok: false, error: err, count: 0, machines: [] });
         continue;
       }
-      const targets = list.filter((m) => selected(ac, m.id));
+      const targets = list.filter((m) => selectedFor(ac, acc, m));
       const ms = [];
       for (const m of targets) {
         const r = await call(acc, "DELETE", `/v1/machines/${encodeURIComponent(m.id)}/activity-leases/${encodeURIComponent(acc.lease)}`);
@@ -3469,7 +4358,8 @@ function randomHex(bytes = 16) {
 async function state(c) {
   const { conf, error: confError } = await loadConfig(c);
   const winSt = await loadWinState(c);
-  const win = windowView(conf, winPhase(conf, winSt, Date.now()), winSt);
+  reconcileWinState(conf, winSt);
+  const win = windowView(conf.window, winPhase(conf.window, winSt, Date.now()), winSt, { scope: "default" });
   let live = null;
   if (c.cfgKv) {
     try {
@@ -3512,12 +4402,30 @@ async function state(c) {
       ttl: acc.ttl,
       autoResume: acc.autoResume,
       envMachine: acc.machine,
-      conf: ac ? { enabled: ac.enabled, mode: ac.mode, machines: ac.machines, skip: ac.skip || [] } : null,
+      conf: ac
+        ? {
+            enabled: ac.enabled,
+            mode: ac.mode,
+            machines: ac.machines,
+            skip: ac.skip || [],
+            inheritSelection: ac.inheritSelection === true,
+          }
+        : null,
       count: list.length,
       error: err,
     });
     for (const m of list) {
       const l = liveMap.get(m.id);
+      const eff = effectiveWindow(conf, acc.account, m.id);
+      const entry = winEntryFor(winSt, acc.account, m.id);
+      const machineWindow = windowView(eff.window, winPhase(eff.window, entry, Date.now()), entry, {
+        scope: "machine",
+        account: acc.account,
+        id: m.id,
+        inherited: eff.inherited,
+        source: eff.inherited ? "default" : "machine",
+        label: eff.inherited ? `跟随默认：${windowLabel(eff.window)}` : windowLabel(eff.window),
+      });
       rows.push({
         account: acc.account,
         id: m.id,
@@ -3526,10 +4434,17 @@ async function state(c) {
         selected: selectedFor(ac, acc, m),
         expiresAt: l?.expiresAt || null,
         lastRenewAt: live?.at || null,
-        // 下面三个来自列表里的完整机器对象（没拿到就是 null，面板照常显示）
+        // 下面这些来自列表里的完整机器对象（没拿到就是 null，面板照常显示）
         autoSuspendedAt: m.raw?.autoSuspendedAt || null,
         cooldownUntil: m.raw?.cooldownUntil || null,
+        // abuse_* 说明是安全审查锁（最长 24 小时），空说明是 max-run 到点
+        cooldownReason: m.raw?.cooldownReason || "",
         maxRunMinutes: m.raw?.maxRunMinutes ?? null,
+        // 本轮连续运行的起点：配合 maxRunMinutes 能算出「还有多久到上限」
+        runStartedAt: m.raw?.runStartedAt || null,
+        free: m.raw?.free === true,
+        lastError: m.raw?.lastError?.message || m.raw?.lastError?.code || "",
+        window: machineWindow,
       });
     }
   }
@@ -3566,8 +4481,41 @@ async function updateConfig(c, body) {
   if (typeof body.paused === "boolean") conf.paused = body.paused;
 
   // 保活区间：只传要改的字段就行，其余保持不变
+  let windowChanged = false;
   if (body.window && typeof body.window === "object") {
     conf.window = normalizeWindow({ ...conf.window, ...body.window });
+    windowChanged = true;
+  }
+
+  // 单台机器覆盖：body.machine = { account, id, window }；window=null 清除覆盖。
+  // 机器 id 做长度校验，防止异常请求把 KV 键撑大。
+  let machineWindowChanged = null;
+  if (body.machine && typeof body.machine === "object") {
+    const account = Number.parseInt(body.machine.account, 10);
+    const id = String(body.machine.id || "").trim();
+    if (!Number.isSafeInteger(account) || account < 1) return { ok: false, error: "账号编号不对" };
+    if (!validMachineId(id)) return { ok: false, error: "机器 id 不对" };
+    const machineId = String(id).trim();
+    const key = String(account);
+    const isNew = !conf.accounts[key];
+    const ac = conf.accounts[key] || blankAccountConfig();
+    if (!ac.windows) ac.windows = {};
+    if (body.machine.window === null || body.machine.reset === true) {
+      // 没有单机覆盖时恢复默认是无操作，但不能中途 return：同一请求可能还
+      // 带 paused/window/accounts 等其它修改，后面会统一保存。
+      if (!isNew && ac.windows[machineId]) delete ac.windows[machineId];
+      else machineWindowChanged = { account, id: machineId, unchanged: true };
+    } else if (body.machine.window && typeof body.machine.window === "object") {
+      const eff = effectiveWindow(conf, account, machineId);
+      ac.windows[machineId] = normalizeWindow({ ...eff.window, ...body.machine.window });
+    } else {
+      return { ok: false, error: "缺 window（传 null 可恢复默认）" };
+    }
+    if (!machineWindowChanged?.unchanged) {
+      if (isNew) ac.inheritSelection = true;
+      conf.accounts[key] = ac;
+      machineWindowChanged = { account, id: machineId };
+    }
   }
 
   // Telegram：null = 清掉网页里的覆盖、回退环境变量；
@@ -3590,6 +4538,9 @@ async function updateConfig(c, body) {
   }
 
   if (body.accounts && typeof body.accounts === "object") {
+    // 兼容旧前端/脚本在只改 skip 时省略 mode：已有账号保留原筛选方式；
+    // 新账号则继续跟随环境变量，不能因为手写 skip 就变成 mode=all。
+    const hadAccounts = new Set(Object.keys(conf.accounts));
     for (const [k, v] of Object.entries(body.accounts)) {
       const n = Number.parseInt(k, 10);
       if (!Number.isSafeInteger(n) || n < 1) continue;
@@ -3600,34 +4551,69 @@ async function updateConfig(c, body) {
         continue;
       }
       if (!v || typeof v !== "object") continue;
-      const prev = conf.accounts[key] || { enabled: true, mode: "all", machines: [], skip: [] };
-      // skip 是机器人维护的，面板改开关时原样带着走，别把「关掉的机器」又放回保活
+      const prev = conf.accounts[key] || blankAccountConfig();
+      // skip 是机器人维护的，面板改开关时原样带着走，别把「关掉的机器」又放回保活。
       const next = {
         enabled: typeof v.enabled === "boolean" ? v.enabled : prev.enabled,
         mode: prev.mode,
         machines: prev.machines,
-        skip: prev.skip || [],
+        skip: Array.isArray(v.skip) ? v.skip.map(String).filter(Boolean) : prev.skip || [],
+        inheritSelection: prev.inheritSelection === true,
+        windows: prev.windows || {},
       };
+      if (!hadAccounts.has(key) && v.mode === undefined && !Array.isArray(v.machines)) next.inheritSelection = true;
       if (v.mode === "all") {
         next.mode = "all";
         next.machines = [];
+        next.inheritSelection = false;
       } else if (Array.isArray(v.machines)) {
         next.mode = "list";
         next.machines = v.machines.map(String).filter(Boolean);
+        next.inheritSelection = false;
       } else if (v.mode === "list") {
         next.mode = "list";
+        next.inheritSelection = false;
       }
       conf.accounts[key] = next;
     }
   }
 
+  // 恢复默认且本来就没有覆盖、又没带其它修改时，整个请求是无操作。
+  const onlyNoopReset =
+    machineWindowChanged?.unchanged === true &&
+    !windowChanged &&
+    typeof body.paused !== "boolean" &&
+    !body.telegram &&
+    !body.accounts;
+  if (onlyNoopReset) return { ok: true, config: normalizeConfig(conf), canSave: true, unchanged: true };
   await saveConfig(c, conf);
-  // 区间改了就把运行状态清掉：否则旧的 startedAt 会让新的单次上限立刻触顶
-  if (body.window) {
-    try {
-      await c.cfgKv.delete(WIN_KEY);
-    } catch {}
-    winMemo.delete("state");
+  // 区间改了只清受影响的计时：否则旧的 startedAt 会让新的单次上限立刻触顶。
+  if (windowChanged) await resetWinState(c, { default: true, conf });
+  if (machineWindowChanged && !machineWindowChanged.unchanged) await resetWinState(c, machineWindowChanged);
+  // 筛选方式变了（例如从环境变量跟随切到面板白名单）也要清掉旧计时。
+  // 合并账号变更，避免账号多时产生一串 KV 读写。
+  if (body.accounts && typeof body.accounts === "object") {
+    const changed = new Set();
+    for (const k of Object.keys(body.accounts)) {
+      const n = Number.parseInt(k, 10);
+      if (!Number.isSafeInteger(n) || n < 1) continue;
+      const v = body.accounts[k];
+      if (v === null || v === "reset" || (v && typeof v === "object" && (v.enabled !== undefined || v.mode !== undefined || Array.isArray(v.machines)))) {
+        changed.add(n);
+      }
+    }
+    if (changed.size) {
+      const state = await loadWinState(c);
+      let dirty = false;
+      for (const key of Object.keys(state.machines)) {
+        const cut = key.indexOf(":");
+        if (cut > 0 && changed.has(Number.parseInt(key.slice(0, cut), 10))) {
+          delete state.machines[key];
+          dirty = true;
+        }
+      }
+      if (dirty) await saveWinState(c, state);
+    }
   }
   // 返回给前端前把 token/secret 抹掉：明文只在 KV 和 Worker 内存里待着
   const clean = normalizeConfig(conf);
@@ -4127,6 +5113,9 @@ const TG_HELPERS = {
   clearLive,
   windowInfo,
   patchWindow,
+  effectiveWindow,
+  winEntryFor,
+  resetWinState,
 };
 
 export default {
@@ -4136,6 +5125,8 @@ export default {
     await notify(c, out);
     if (out.ok) console.log("instabox-keepalive:", JSON.stringify(out));
     else console.error("instabox-keepalive:", JSON.stringify(out));
+    // 返回值 Cloudflare 不关心，但单测靠它断言每台机器的结果
+    return out;
   },
 
   async fetch(request, env) {

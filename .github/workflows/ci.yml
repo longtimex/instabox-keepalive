@@ -1,7 +1,7 @@
 name: ci
 
 # 一套工作流覆盖全部回归：
-#   unit        node 跑的 Worker 单测（81 项，进程内假 KV + 假 API + 假 Telegram）
+#   unit        node 跑的 Worker 单测（123 项，进程内假 KV + 假 API + 假 Telegram）
 #   shell       keepalive.sh 的 shell 回归（26 项，node 假 API）
 #   alpine      同上，但在 BusyBox ash 里跑（VPS 上最常见的就是这种）
 #   integration tools/run_tests.sh（python 假 API，shell + worker 端到端）

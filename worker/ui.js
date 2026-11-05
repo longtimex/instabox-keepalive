@@ -105,6 +105,12 @@ td .btn+.btn{margin-left:6px}
 .wbar input[type=text]{width:210px}
 .wbar input[type=password]{width:250px}
 .wbar .wtag{font-size:13px}
+/* 多段时间：一行一段，窄屏整段换行，不把「09:00 至 12:00」拆开 */
+.wranges{display:flex;flex-direction:column;gap:8px;padding:10px 16px 0}
+.wrange{display:flex;align-items:center;gap:6px;flex-wrap:wrap;white-space:nowrap}
+/* flex:0 0 auto 必须加：不然窄屏会把时间框压到放不下时钟图标 */
+.wrange input[type=time]{flex:0 0 auto;font:inherit;font-size:13px;padding:5px 8px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--text);width:104px}
+.wfoot{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 16px 0;font-size:12px}
 .wstate{padding:8px 16px 14px;font-size:12.5px;color:var(--muted)}
 .wstate.warn{color:var(--warn)}
 
@@ -156,6 +162,9 @@ dialog.modal .field input{
   border:1px solid var(--line);background:var(--bg);color:var(--text);
 }
 dialog.modal .field input:focus{outline:2px solid var(--accent-weak);border-color:var(--accent)}
+dialog.modal .field input[type=checkbox]{width:auto;margin:0 8px 0 0;vertical-align:middle}
+dialog.modal .field .wgrp{display:flex;align-items:center;gap:6px}
+dialog.modal .field .wgrp input[type=time]{width:auto;min-width:0;flex:1}
 dialog.modal .err{color:var(--bad);font-size:12.5px;margin:0 0 12px}
 dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
 
@@ -203,15 +212,10 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
       </div>
       <div class="wbar">
         <span class="wgrp">
-          <label class="sw" title="只在这段时间里续租">
+          <label class="sw" title="只在这些时间段里续租">
             <input type="checkbox" id="w-on"><i></i>
           </label>
           <span class="wtag">只在时间段内保活</span>
-        </span>
-        <span class="wgrp">
-          <input type="time" id="w-start" value="08:00" step="60">
-          <span class="muted">至</span>
-          <input type="time" id="w-end" value="23:00" step="60">
         </span>
         <span class="wgrp">
           <span class="muted">单次上限</span>
@@ -219,6 +223,11 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
           <span class="muted">分钟（0 = 不限）</span>
         </span>
         <button class="btn tiny primary" id="b-wsave" type="button">保存</button>
+      </div>
+      <div class="wranges" id="w-ranges"></div>
+      <div class="wfoot">
+        <button class="btn tiny" id="b-wadd" type="button">＋ 添加时间段</button>
+        <span class="muted">可加多段，每段之间机器会自然休眠；跨午夜写 22:00 至 06:00</span>
       </div>
       <div class="wstate" id="wstate"></div>
     </section>
@@ -233,7 +242,7 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
           <thead>
             <tr>
               <th>账号</th><th>机器</th><th>状态</th><th>租约</th>
-              <th class="c">保活</th><th class="r">操作</th>
+              <th>区间</th><th class="c">保活</th><th class="r">操作</th>
             </tr>
           </thead>
           <tbody id="mrows"></tbody>
@@ -317,6 +326,31 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
     <div class="row">
       <button class="btn" type="button" id="acct-cancel">取消</button>
       <button class="btn primary" type="submit" id="acct-save">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="mwin" class="modal">
+  <form id="mwin-form" autocomplete="off">
+    <h2 id="mwin-title">机器保活区间</h2>
+    <p class="sub" id="mwin-sub">不自定义时跟随上方的默认区间。</p>
+    <label class="field">
+      <span><input type="checkbox" id="mwin-on"> 只在时间段内保活（不勾选 = 全天）</span>
+    </label>
+    <div class="field">
+      <span>时间段（北京时间，可加多段）</span>
+      <div class="wranges" id="mwin-ranges"></div>
+      <button class="btn tiny" id="mwin-add" type="button">＋ 添加时间段</button>
+    </div>
+    <label class="field">
+      <span>单次保活上限（分钟，0 = 不限）</span>
+      <input type="number" id="mwin-max" min="0" max="1440" step="15" value="0">
+    </label>
+    <p class="err hide" id="mwin-err"></p>
+    <div class="row">
+      <button class="btn" type="button" id="mwin-cancel">取消</button>
+      <button class="btn" type="button" id="mwin-reset">跟随默认</button>
+      <button class="btn primary" type="submit" id="mwin-save">保存</button>
     </div>
   </form>
 </dialog>
@@ -468,12 +502,39 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
       var st = m.state || "unknown";
       var stCls = st === "running" ? "ok" : (st === "suspended" || st === "stopped" ? "warn" : "");
       var r = leftInfo(m.expiresAt);
-      // 冷却中：这时候点「唤醒」一定会被平台拒（409 machine_cooldown），先标出来
+      // 冷却中：这时候点「唤醒」一定会被平台拒（409 machine_cooldown），先标出来。
+      // cooldownReason 是 abuse_* 说明是安全审查锁（最长 24 小时），
+      // 空则是 max-run 到点（5-20 分钟，免费版连坐能到 2 小时）—— 两者提示要分开。
       var cooling = m.cooldownUntil && new Date(m.cooldownUntil).getTime() > Date.now();
-      var cool = cooling
-        ? '<div class="mid muted">冷却中，还剩 ' + esc(leftInfo(m.cooldownUntil).text.replace("后到期", "")) + "</div>"
-        : "";
+      var cool = "";
+      if (cooling) {
+        var abuse = /^abuse_/.test(m.cooldownReason || "");
+        cool = '<div class="mid muted">' + (abuse ? "安全审查锁，还剩 " : "冷却中，还剩 ") +
+          esc(leftInfo(m.cooldownUntil).text.replace("后到期", "")) + "</div>";
+      } else if (m.maxRunMinutes > 0 && m.runStartedAt) {
+        // 免费版 480 分钟到点就会被平台强制暂停，提前把剩余时间摆出来
+        var endMs = new Date(m.runStartedAt).getTime() + m.maxRunMinutes * 60000;
+        if (endMs > Date.now()) {
+          cool = '<div class="mid muted">距 max-run 上限还有 ' +
+            esc(leftInfo(new Date(endMs).toISOString()).text.replace("后到期", "")) + "</div>";
+        }
+      }
       var dis = readOnly ? " disabled" : "";
+      // 区间编辑依赖 CONFIG KV；没有 KV 时只禁用区间按钮，不能连无需 KV 的
+      // 续租/唤醒/释放一起禁用。
+      var winDis = readOnly || !data.canSave ? " disabled" : "";
+      var w = m.window || {};
+      var segs = Array.isArray(w.ranges) ? w.ranges : [];
+      var winText;
+      if (!w.on) winText = "全天";
+      else if (segs.length > 1) winText = segs.length + " 段";
+      else if (segs.length) winText = segs[0].startAt + "–" + segs[0].endAt;
+      else winText = w.startAt + "–" + w.endAt;
+      if (w.maxMin) winText += " · ≤" + w.maxMin + "分";
+      if (w.inherited) winText = "默认 · " + winText;
+      var winCls = w.phase === "idle" || w.phase === "capped" ? "warn" : (w.inherited ? "muted" : "ok");
+      var winCell = '<button class="btn tiny" data-act="mwin" data-a="' + m.account + '" data-id="' + esc(m.id) + '"' + winDis + ">" +
+        esc(winText) + '</button><div class="mid ' + winCls + '">' + esc(w.inherited ? "跟随默认" : "单独设置") + "</div>";
       var ops = '<button class="btn tiny" data-act="renew" data-a="' + m.account + '" data-id="' + esc(m.id) + '"' + dis + ">续租</button>";
       if (st !== "running") {
         ops += '<button class="btn tiny" data-act="resume" data-a="' + m.account + '" data-id="' + esc(m.id) + '"' + dis + ">唤醒</button>";
@@ -485,6 +546,7 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
         '<td><div class="mname">' + esc(m.name) + '</div><div class="mid mono">' + esc(m.id) + "</div></td>" +
         '<td><span class="badge ' + stCls + '">' + esc(st) + "</span>" + cool + "</td>" +
         '<td><span class="left ' + r.cls + '" data-exp="' + esc(m.expiresAt || "") + '">' + esc(r.text) + "</span></td>" +
+        "<td>" + winCell + "</td>" +
         '<td class="c"><label class="sw"><input type="checkbox" data-act="toggle" data-a="' + m.account +
           '" data-id="' + esc(m.id) + '"' + (m.selected ? " checked" : "") + dis + "><i></i></label></td>" +
         '<td class="r">' + ops + "</td>" +
@@ -496,31 +558,94 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
   // 用户动过区间表单但还没保存时，别让 20 秒一次的自动刷新把输入覆盖掉
   var wDirty = false;
 
+  // 多段时间的一行：起点 / 至 / 终点 / 删除。窄屏整行换行，不拆开时间
+  function rangeRow(startAt, endAt) {
+    return '<span class="wrange">' +
+      '<input type="time" class="r-start" value="' + esc(startAt || "08:00") + '" step="60">' +
+      '<span class="muted">至</span>' +
+      '<input type="time" class="r-end" value="' + esc(endAt || "23:00") + '" step="60">' +
+      '<button class="btn tiny danger" type="button" data-del="1">删除</button>' +
+      "</span>";
+  }
+
+  function setRangesDisabled(id, dis) {
+    var box = $(id);
+    if (!box) return;
+    var nodes = box.querySelectorAll("input,button");
+    for (var i = 0; i < nodes.length; i++) nodes[i].disabled = dis;
+  }
+
+  function fillRanges(id, ranges) {
+    var box = $(id);
+    if (!box) return;
+    var list = Array.isArray(ranges) && ranges.length ? ranges : [{ startAt: "08:00", endAt: "23:00" }];
+    box.innerHTML = list.map(function (r) { return rangeRow(r.startAt, r.endAt); }).join("");
+    setRangesDisabled(id, readOnly || !data.canSave);
+  }
+
+  function addRange(id, startAt, endAt) {
+    var box = $(id);
+    if (!box) return;
+    box.insertAdjacentHTML("beforeend", rangeRow(startAt, endAt));
+    setRangesDisabled(id, readOnly || !data.canSave);
+  }
+
+  // 读回所有段；时间非法就退回当前值，避免把 00:00 静默写进去
+  function collectRanges(id, fallback) {
+    var box = $(id);
+    var out = [];
+    if (!box) return out;
+    var rows = box.querySelectorAll(".wrange");
+    var fb = fallback || { start: 480, end: 1380 };
+    for (var i = 0; i < rows.length; i++) {
+      var s = rows[i].querySelector(".r-start");
+      var e = rows[i].querySelector(".r-end");
+      out.push({ start: toMin(s && s.value, fb.start), end: toMin(e && e.value, fb.end) });
+    }
+    return out;
+  }
+
+  function bindRangeBox(id, onDirty) {
+    var box = $(id);
+    if (!box) return;
+    box.addEventListener("click", function (e) {
+      var btn = e.target.closest ? e.target.closest("[data-del]") : null;
+      if (!btn) return;
+      var row = btn.closest(".wrange");
+      if (row) row.remove();
+      // 删光了补回一行：空数组会让后端退回默认，用户会以为「删掉 = 全天」
+      if (!box.querySelectorAll(".wrange").length) addRange(id);
+      if (onDirty) onDirty();
+    });
+    box.addEventListener("input", function () { if (onDirty) onDirty(); });
+  }
+
   function renderWindow() {
     var w = data.window;
     var el = $("wstate");
     if (!w) { el.textContent = ""; return; }
 
+    var dis = readOnly || !data.canSave;
     if (!wDirty) {
       $("w-on").checked = !!w.on;
-      $("w-start").value = w.startAt || "08:00";
-      $("w-end").value = w.endAt || "23:00";
       $("w-max").value = w.maxMin || 0;
+      fillRanges("w-ranges", w.ranges);
+    } else {
+      setRangesDisabled("w-ranges", dis);
     }
 
-    var dis = readOnly || !data.canSave;
     $("w-on").disabled = dis;
-    $("w-start").disabled = dis;
-    $("w-end").disabled = dis;
     $("w-max").disabled = dis;
     $("b-wsave").disabled = dis;
+    $("b-wadd").disabled = dis;
 
     var t = "现在北京时间 " + w.nowAt + " · ";
     var cls = "wstate";
+    var segCount = (w.ranges || []).length;
     if (!w.on) {
       t += w.maxMin ? "全天保活，单次最多 " + w.maxMin + " 分钟" : "全天保活";
     } else if (w.phase === "idle") {
-      t += "不在区间内，cron 不续租，机器会自然休眠";
+      t += "不在区间内（共 " + segCount + " 段），cron 不续租，机器会自然休眠";
       cls += " warn";
     } else if (w.phase === "capped") {
       t += "本轮已保活 " + w.keptMin + " 分钟，到 " + w.maxMin + " 分钟上限了";
@@ -610,6 +735,9 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
     $("app").classList.remove("hide");
     // 没启用登录（没配密码/TOKEN）就不显示退出/账号按钮
     var canAuth = !!(data.auth && data.auth.via !== "open");
+    // renderMachines 依赖这个值决定区间按钮是否可编辑；在 render() 里统一
+    // 由服务端 auth.canWrite 计算，避免读到一个旧的只读状态。
+    readOnly = !!(data.auth && data.auth.canWrite === false);
     $("b-logout").classList.toggle("hide", !canAuth);
     $("b-account").classList.toggle("hide", !canAuth);
     $("pill").textContent = data.paused ? "已暂停" : "运行中";
@@ -635,7 +763,6 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
       n.className = "notice hide";
     }
 
-    readOnly = !!(data.auth && data.auth.canWrite === false);
     $("b-renew").disabled = readOnly;
     $("b-pause").disabled = readOnly;
     $("b-logclear").disabled = readOnly;
@@ -656,6 +783,8 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
 
   function load() {
     if (loading) return;
+    // 弹窗编辑期间不做后台回填；保存后主动 load，用户输入不会被覆盖。
+    if ($("mwin") && $("mwin").open) return;
     loading = true;
     return api("/api/state").then(function (j) {
       loading = false;
@@ -678,6 +807,39 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
     });
   }
 
+  var winTarget = null;
+
+  function findMachine(a, id) {
+    var ms = (data && data.machines) || [];
+    for (var i = 0; i < ms.length; i++) {
+      if (String(ms[i].account) === String(a) && String(ms[i].id) === String(id)) return ms[i];
+    }
+    return null;
+  }
+
+  function openMachineWindow(a, id) {
+    var m = findMachine(a, id);
+    if (!m) { toast("机器已不在列表里，刷新后重试", true); return; }
+    // 弹窗里的区间字段回填“实际生效值”：继承默认时直接展示默认配置，
+    // 用户改前能看见自己将从什么值开始，而不是空白/08:00 的假值。
+    winTarget = { account: Number(a), id: m.id, name: m.name || m.id };
+    var w = m.window || {};
+    $("mwin-title").textContent = (m.name || m.id) + " 的保活区间";
+    $("mwin-sub").textContent = w.inherited
+      ? "当前跟随默认区间；保存后只覆盖这台机器。"
+      : "这台机器使用单独设置；可随时恢复跟随默认。";
+    $("mwin-on").checked = !!w.on;
+    $("mwin-max").value = w.maxMin || 0;
+    fillRanges("mwin-ranges", w.ranges);
+    $("mwin-err").classList.add("hide");
+    $("mwin").showModal();
+  }
+
+  function closeMachineWindow() {
+    winTarget = null;
+    $("mwin").close();
+  }
+
   function saveAccount(a, patch) {
     var body = { accounts: {} };
     body.accounts[String(a)] = patch;
@@ -692,7 +854,8 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
     // - 有面板配置：list 模式取白名单，all 模式取全部
     // - 没面板配置：选中态来自环境变量 INSTABOX_MACHINE，用服务端返回的 selected
     //   若按 all 当基准，取消勾选一台就会把其它本来没保活的机器一起写进白名单。
-    var cur = (acc && acc.conf)
+    // 只配了单机区间时，筛选范围仍由环境变量决定，不能把 all 当成基准。
+    var cur = (acc && acc.conf && !acc.conf.inheritSelection)
       ? (acc.conf.mode === "list" ? acc.conf.machines.slice() : all.slice())
       : list.filter(function (m) { return m.selected; }).map(function (m) { return m.id; });
     // 白名单里可能残留已删除机器的 id，保存前过滤掉
@@ -704,8 +867,11 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
     } else {
       next = cur.filter(function (x) { return x !== id; });
     }
-    if (all.length && next.length >= all.length) { saveAccount(a, { enabled: true, mode: "all" }); return; }
-    saveAccount(a, { enabled: true, mode: "list", machines: next });
+    // skip 是 Telegram 维护的「点名关闭」名单，打开机器时必须一起摘掉，
+    // 否则 mode=all 下即使勾选开关，cron 仍会跳过它。
+    var skip = (acc && acc.conf && Array.isArray(acc.conf.skip) ? acc.conf.skip : []).filter(function (x) { return x !== id; });
+    // 所有分支都显式带 skip：mode:all 若不传 skip，后端会按“未提供”保留旧名单。
+    saveAccount(a, { enabled: true, mode: all.length && next.length >= all.length ? "all" : "list", machines: next, skip: skip });
   }
 
   function machineAction(a, id, action, btn) {
@@ -731,7 +897,9 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
     var a = el.getAttribute("data-a");
     var id = el.getAttribute("data-id");
 
-    if (act === "renew" || act === "resume" || act === "release") {
+    if (act === "mwin") {
+      openMachineWindow(a, id);
+    } else if (act === "renew" || act === "resume" || act === "release") {
       machineAction(a, id, act, el);
     } else if (act === "accall") {
       saveAccount(a, { enabled: true, mode: "all" });
@@ -743,6 +911,12 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
   document.addEventListener("change", function (e) {
     var t = e.target;
     var act = t.getAttribute && t.getAttribute("data-act");
+    // 面板只读或没绑 CONFIG 时别发注定失败的写请求，直接把开关恢复。
+    if ((act === "toggle" || act === "acc") && (readOnly || !data.canSave)) {
+      toast("当前是只读模式，开关不会保存", true);
+      load();
+      return;
+    }
     if (act === "toggle") setMachine(t.getAttribute("data-a"), t.getAttribute("data-id"), t.checked);
     else if (act === "acc") saveAccount(t.getAttribute("data-a"), { enabled: t.checked });
   });
@@ -782,21 +956,79 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
     return h > 23 || mi > 59 ? fallback : h * 60 + mi;
   }
 
-  ["w-on", "w-start", "w-end", "w-max"].forEach(function (id) {
+  // 默认区间的表单脏标记：时间段是动态行，用事件委托统一监听
+  ["w-on", "w-max"].forEach(function (id) {
     var el = $(id);
     if (!el) return;
     el.addEventListener("input", function () { wDirty = true; });
     el.addEventListener("change", function () { wDirty = true; });
   });
+  bindRangeBox("w-ranges", function () { wDirty = true; });
+  $("b-wadd").addEventListener("click", function () {
+    addRange("w-ranges", "18:00", "23:00");
+    wDirty = true;
+  });
+  $("mwin-add").addEventListener("click", function () {
+    addRange("mwin-ranges", "18:00", "23:00");
+  });
+
+  function machineWindowPatch() {
+    var w = (winTarget && findMachine(winTarget.account, winTarget.id)?.window) || {};
+    var first = (Array.isArray(w.ranges) && w.ranges[0]) || { start: 480, end: 1380 };
+    var maxMin = Math.max(0, Math.min(1440, Number($("mwin-max").value) || 0));
+    return {
+      account: winTarget.account,
+      id: winTarget.id,
+      window: {
+        on: $("mwin-on").checked,
+        ranges: collectRanges("mwin-ranges", { start: first.start, end: first.end }),
+        maxMin: maxMin,
+      },
+    };
+  }
+
+  function submitMachineWindow(body, reset) {
+    var err = $("mwin-err");
+    err.classList.add("hide");
+    var b = $("mwin-save");
+    b.disabled = true;
+    var target = winTarget;
+    api("/api/config", { method: "POST", body: { machine: body } }).then(function (j) {
+      b.disabled = false;
+      if (!j.ok) {
+        err.textContent = j.error || "保存失败";
+        err.classList.remove("hide");
+        return;
+      }
+      closeMachineWindow();
+      toast(reset ? "已恢复跟随默认区间" : "已保存这台机器的区间");
+      load();
+    }).catch(function (e) {
+      b.disabled = false;
+      err.textContent = "请求失败：" + e.message;
+      err.classList.remove("hide");
+    });
+  }
+
+  $("mwin-form").addEventListener("submit", function (e) {
+    e.preventDefault();
+    if (!winTarget) return;
+    submitMachineWindow({ account: winTarget.account, id: winTarget.id, window: machineWindowPatch().window }, false);
+  });
+  $("mwin-cancel").addEventListener("click", closeMachineWindow);
+  $("mwin-reset").addEventListener("click", function () {
+    if (!winTarget) return;
+    submitMachineWindow({ account: winTarget.account, id: winTarget.id, window: null }, true);
+  });
 
   $("b-wsave").addEventListener("click", function () {
     var w = (data && data.window) || {};
+    var first = (Array.isArray(w.ranges) && w.ranges[0]) || { start: 480, end: 1380 };
     var maxMin = Math.max(0, Math.min(1440, Number($("w-max").value) || 0));
     var patch = {
       window: {
         on: $("w-on").checked,
-        start: toMin($("w-start").value, w.start == null ? 480 : w.start),
-        end: toMin($("w-end").value, w.end == null ? 1380 : w.end),
+        ranges: collectRanges("w-ranges", { start: first.start, end: first.end }),
         maxMin: maxMin,
       },
     };

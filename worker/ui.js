@@ -471,29 +471,39 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
         if (ms[i].state !== "running") pending++;
       }
     }
+    var lastLease = data.lastLeaseAt ? when(data.lastLeaseAt) : "还没有成功续租";
+    var expiring = 0;
+    for (var j = 0; j < ms.length; j++) {
+      var end = Date.parse(ms[j].expiresAt || "");
+      if (ms[j].selected && Number.isFinite(end) && end - Date.now() < 120000) expiring++;
+    }
     $("stats").innerHTML =
       statCard("机器", ms.length, "受这个 Worker 管理") +
       statCard("运行中", running, "state = running") +
-      statCard("保活中", on, "下一轮会续租") +
-      statCard("待唤醒", pending, pending ? "已挂起或停机" : "全部正常");
+      statCard("保活中", on, expiring ? expiring + " 台租约即将过期" : (pending ? pending + " 台待唤醒" : "没有待唤醒机器")) +
+      statCard("最近续租", data.paused ? "暂停" : lastLease, data.paused ? "cron 当前不会续租" : "仅成功 PUT 后更新");
   }
 
   function renderMachines() {
     var ms = data.machines || [];
     $("mempty").classList.toggle("hide", ms.length > 0);
-    // 上次续租距今多久：超过 TTL 的一半就该警觉，超过一个 TTL 说明调度大概率已经停了
-    if (data.liveAt) {
+    // 必须显示“最近一次成功 lease”，不能用 liveAt（最近一次执行）冒充：
+    // 持续失败时 liveAt 每轮都会变新，会掩盖真正失效的保活。
+    if (data.lastLeaseAt) {
       var ttlMs = 900 * 1000;
       for (var ai = 0; ai < data.accounts.length; ai++) {
         if (data.accounts[ai].ttl && data.accounts[ai].ttl * 1000 < ttlMs) ttlMs = data.accounts[ai].ttl * 1000;
       }
-      var age = Date.now() - Date.parse(data.liveAt);
+      var age = Date.now() - Date.parse(data.lastLeaseAt);
       var ageCls = age > ttlMs ? "c-bad" : (age > ttlMs * 0.6 ? "c-warn" : "");
+      var lim = 0;
+      for (var li = 0; li < ms.length; li++) if (ms[li].selected && ms[li].liveLimit) lim++;
       $("mhint").innerHTML =
-        '上次续租 <span class="' + ageCls + '">' + esc(ago(data.liveAt)) + "</span>前" +
+        '最近成功续租 <span class="' + ageCls + '">' + esc(ago(data.lastLeaseAt)) + "</span>前" +
+        (lim ? ' · <span class="c-warn">' + lim + " 台受平台限制</span>" : "") +
         (data.alertOn ? "" : " · 未开告警");
     } else {
-      $("mhint").textContent = data.canSave ? "还没跑过续租" : "未绑定 CONFIG，租约时间不可见";
+      $("mhint").textContent = data.canSave ? "还没有成功续租" : "未绑定 CONFIG，租约时间不可见";
     }
 
     var html = "";
@@ -511,6 +521,10 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
         var abuse = /^abuse_/.test(m.cooldownReason || "");
         cool = '<div class="mid muted">' + (abuse ? "安全审查锁，还剩 " : "冷却中，还剩 ") +
           esc(leftInfo(m.cooldownUntil).text.replace("后到期", "")) + "</div>";
+      } else if (m.earlyAllowanceEnded) {
+        cool = '<div class="mid muted">免费额度已结束：先暂停/删除一台运行中的机器，或升级套餐</div>';
+      } else if (m.maxRunMinutes === 0) {
+        cool = '<div class="mid muted">max-run 已禁用：先在 InstaBox 改回可运行设置</div>';
       } else if (m.maxRunMinutes > 0 && m.runStartedAt) {
         // 免费版 480 分钟到点就会被平台强制暂停，提前把剩余时间摆出来
         var endMs = new Date(m.runStartedAt).getTime() + m.maxRunMinutes * 60000;
@@ -747,6 +761,16 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
 
     var n = $("notice");
     var msgs = [];
+    if (data.paused) {
+      msgs.push("保活已暂停：cron 不会调用 InstaBox，现有租约到期后机器会按平台规则休眠。需要续租请点右侧“恢复保活”。");
+    }
+    var limitedRows = (data.machines || []).filter(function (m) { return m.selected && m.liveLimit; });
+    if (limitedRows.length && !data.paused) {
+      msgs.push("有 " + limitedRows.length + " 台机器受平台限制（冷却/配额/max-run）：查看机器行说明；不能靠重复续租解决。");
+    }
+    if (data.ok === false) {
+      msgs.push("当前快照不完整：至少一个账号的机器列表读取失败，下面的状态不代表全部机器。");
+    }
     if (data.auth && data.auth.canWrite === false) {
       msgs.push("面板没设密码，现在是<b>只读</b>：能看，但不能续租或改配置。设 <code>ADMIN_PASSWORD</code> 或 <code>TOKEN</code> 后恢复。");
     }
@@ -789,9 +813,13 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
     return api("/api/state").then(function (j) {
       loading = false;
       if (j._status === 401) { toLogin(); return; }
-      if (!j.ok) { toast(j.error || "加载失败", true); return; }
+      // /api/state 可能返回 ok:false 但仍带完整 accounts/machines（例如单个账号
+      // 列机器失败）。这种降级快照必须继续渲染并展示 warning，不能整页空白。
+      var usable = j && Array.isArray(j.accounts) && Array.isArray(j.machines);
+      if (!j.ok && !usable) { toast(j.error || "加载失败", true); return; }
       data = j;
       render();
+      if (!j.ok) toast(j.error || "部分账号读取失败，已显示可用状态", true);
     }).catch(function (e) {
       loading = false;
       toast("请求失败：" + e.message, true);
@@ -880,7 +908,16 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
     api("/api/machine", { method: "POST", body: { account: Number(a), id: id, action: action } })
       .then(function (j) {
         if (btn) { btn.disabled = false; btn.textContent = old; }
-        if (!j.ok) { toast(j.error || (action + " 失败"), true); return; }
+        if (!j.ok) {
+          var limitMsg = j.limit === "max_run_disabled" ? "（max-run=0，先在 InstaBox 改回可运行设置）"
+            : j.limit === "quota_exceeded" ? "（平台配额/并发已满）"
+            : j.limit === "blocked" ? "（免费额度已结束）"
+            : j.limit === "throttled" ? "（平台限制启动频率）"
+            : j.limit === "cooling" ? "（平台冷却中）"
+            : "";
+          toast((j.error || (action + " 失败")) + limitMsg, true);
+          return;
+        }
         toast(action === "renew" ? "已续租" : (action === "release" ? "已释放租约" : "已唤醒并续租"));
         load();
       })
@@ -930,7 +967,8 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
     api("/api/renew", { method: "POST", body: {} }).then(function (j) {
       b.disabled = false;
       b.textContent = "全部续租";
-      if (j.ok) toast(j.paused ? "已暂停，跳过" : "已续租 " + j.count + " 台");
+      if (j.paused) toast("已暂停，本次没有续租", true);
+      else if (j.ok) toast("已续租 " + j.count + " 台");
       else toast("有失败：" + (j.error || "看日志"), true);
       load();
     }).catch(function (e) {
@@ -942,7 +980,8 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
 
   $("b-pause").addEventListener("click", function () {
     var next = !(data && data.paused);
-    saveConfig({ paused: next }).then(function (ok) {
+    if (next && !window.confirm("暂停后 cron 不再调用 InstaBox，租约到期后机器会休眠。确定暂停？")) return;
+    saveConfig({ paused: next, pausedBy: "panel" }).then(function (ok) {
       if (ok) toast(next ? "已暂停，cron 不再续租" : "已恢复保活");
     });
   });
@@ -1258,11 +1297,11 @@ dialog.modal .row{display:flex;gap:8px;justify-content:flex-end}
       });
   });
 
-  // 轮询节奏：有人操作时 20 秒一次，闲置时逐步退避到 60 秒。
+  // 轮询节奏：有人操作时 30 秒一次，闲置时逐步退避到 90 秒。
   // 租约倒计时是前端按 expiresAt 自己算的，拉取变慢不影响观感，但能把
   // 「面板开着不动」时的列机器请求砍掉约 2/3。页面隐藏时完全不拉。
-  var POLL_MIN = 20000;
-  var POLL_MAX = 60000;
+  var POLL_MIN = 30000;
+  var POLL_MAX = 90000;
   var pollGap = POLL_MIN;
   var pollTimer = null;
 

@@ -34,8 +34,15 @@ const autoPaused = new Set();
 const cooldowns = {};
 
 // 每个 key 名下的机器。/api/state 会按账号逐个列机器，假 API 也要照做。
+// 新机器发现测试：保活必须用实时列表，不能因为缓存十分钟而漏保。
+const extraMachine = { id: "m_new", name: "newbox", state: "running", autoSuspendedAt: null, cooldownUntil: null };
+let includeExtraMachine = false;
+// 分页测试：全量列表按 2 台一页返回，并产生 nextCursor。
+let paginateMachines = false;
+
 const machinesByKey = () => ({
   ibk_test_key: [
+    ...(includeExtraMachine ? [extraMachine] : []),
     {
       id: "m_1",
       name: "qqq",
@@ -59,15 +66,23 @@ let calls = [];
 let hooks = [];
 let fakeKVPutCount = 0;
 const tgCalls = [];
+let tgRateLimit = 0;
 let leaseFailures = 0;
 let leaseConflicts = 0;
 let leaseRateLimits = 0;
+let leaseQuota = 0;
+let leaseSlowRate = 0;
+let leaseDeleteFailures = 0;
 // 生命周期调用（resume/start/wake）撞 operation_conflict 的次数，以及每次请求带的
 // Idempotency-Key —— 官方要求 operation_conflict 重试时换**新的** key，这里验它
 let lifecycleConflicts = 0;
 const lifecycleKeys = [];
 // 402 early_allowance_ended：免费额度用完，启动被拒
 let lifecycle402 = 0;
+let lifecycleMaxRunDisabled = 0;
+let lifecycleQuota = 0;
+let lifecycleSlowRetry = 0;
+let operationLookupStatus = 0;
 // id -> 额外机器字段（runStartedAt / cooldownReason / free / maxRunMinutes），
 // 默认不设，免得影响老断言的文案
 const machineExtra = {};
@@ -91,10 +106,25 @@ globalThis.fetch = async (input, init = {}) => {
       body = JSON.parse(init.body || "{}");
     } catch {}
     tgCalls.push({ method, body, url: String(input) });
+    if (tgRateLimit > 0) {
+      tgRateLimit -= 1;
+      return Response.json({ ok: false, error_code: 429, description: "Too Many Requests", parameters: { retry_after: 0 } }, { status: 429 });
+    }
+    if (method === "getWebhookInfo") {
+      return Response.json({
+        ok: true,
+        result: {
+          url: "https://worker.test/tg/s3cret",
+          pending_update_count: 0,
+          allowed_updates: ["message", "callback_query"],
+        },
+      });
+    }
     return Response.json({ ok: true, result: { message_id: 1 } });
   }
 
-  calls.push(method + " " + path);
+  // 机器列表的 limit/cursor 是本次回归的关键协议，记录完整 query 供断言。
+  calls.push(method + " " + path + (path === "/v1/machines" ? url.search : ""));
 
   const own = machinesByKey()[init.headers?.["X-API-Key"]];
   if (!own) {
@@ -102,7 +132,25 @@ globalThis.fetch = async (input, init = {}) => {
   }
 
   if (path === "/v1/machines" && method === "GET") {
-    return Response.json({ machines: own });
+    // 线上运行时明确限制 1-200；测试也按真实约束拒绝超大分页，避免回归。
+    const limit = Number(url.searchParams.get("limit") || "200");
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
+      return Response.json({ error: { code: "bad_request", message: "limit must be 1-200" } }, { status: 400 });
+    }
+    // 与真实 API 一样返回瞬时快照：剩余冷却每次按当前时间计算，
+    // 不能在 test 启动时算一次后一直把过期时间留在过去/未来。
+    const now = Date.now();
+    const normalized = own.map((m) => ({
+      ...m,
+      cooldownUntil: m.cooldownUntil
+        ? new Date(now + Math.max(0, Date.parse(m.cooldownUntil) - now)).toISOString()
+        : null,
+    }));
+    if (!paginateMachines) return Response.json({ machines: normalized, nextCursor: null });
+    const start = Number(url.searchParams.get("cursor") || 0);
+    const page = normalized.slice(start, start + 2);
+    const next = start + 2 < normalized.length ? String(start + 2) : null;
+    return Response.json({ machines: page, nextCursor: next });
   }
 
   let m = /^\/v1\/machines\/([^/]+)$/.exec(path);
@@ -129,6 +177,14 @@ globalThis.fetch = async (input, init = {}) => {
           { status: 409 },
         );
       }
+      if (leaseSlowRate > 0) {
+        leaseSlowRate--;
+        return new Response(JSON.stringify({ error: { code: "rate_limited", retryable: true, retryAfterSeconds: 60 } }), { status: 429, headers: { "Retry-After": "60" } });
+      }
+      if (leaseQuota > 0) {
+        leaseQuota--;
+        return new Response(JSON.stringify({ error: { code: "quota_exceeded", retryable: true, retryAfterSeconds: 0.05 } }), { status: 429 });
+      }
       // 限流：带 retryAfterSeconds，验证我们按服务端给的秒数等
       if (leaseRateLimits > 0) {
         leaseRateLimits--;
@@ -142,7 +198,13 @@ globalThis.fetch = async (input, init = {}) => {
       }
       return Response.json({ expiresAt: new Date(Date.now() + 900_000).toISOString() });
     }
-    if (method === "DELETE") return new Response(null, { status: 204 });
+    if (method === "DELETE") {
+      if (leaseDeleteFailures > 0) {
+        leaseDeleteFailures--;
+        return new Response(JSON.stringify({ error: { code: "host_unavailable", retryable: true } }), { status: 503 });
+      }
+      return new Response(null, { status: 204 });
+    }
   }
 
   m = /^\/v1\/machines\/([^/]+)\/(resume|start|stop|suspend|pause|wake)$/.exec(path);
@@ -157,6 +219,18 @@ globalThis.fetch = async (input, init = {}) => {
         JSON.stringify({ error: { code: "early_allowance_ended", retryable: false, message: "free allowance ended" } }),
         { status: 402 },
       );
+    }
+    if (lifecycleMaxRunDisabled > 0) {
+      lifecycleMaxRunDisabled--;
+      return new Response(JSON.stringify({ error: { code: "max_run_disabled", retryable: false } }), { status: 409 });
+    }
+    if (lifecycleQuota > 0) {
+      lifecycleQuota--;
+      return new Response(JSON.stringify({ error: { code: "quota_exceeded", retryable: true, retryAfterSeconds: 60 } }), { status: 429 });
+    }
+    if (lifecycleSlowRetry > 0) {
+      lifecycleSlowRetry--;
+      return new Response(JSON.stringify({ error: { code: "rate_limited", retryable: true, retryAfterSeconds: 60 } }), { status: 429, headers: { "Retry-After": "60" } });
     }
     // 另一个操作正在跑：官方要求等它结束后用**新的** Idempotency-Key 重试
     if (lifecycleConflicts > 0) {
@@ -198,6 +272,9 @@ globalThis.fetch = async (input, init = {}) => {
   // 操作长轮询：?wait=25s 会挂到有变化为止，这里直接回 succeeded
   m = /^\/v1\/operations\/([^/]+)$/.exec(path);
   if (m && method === "GET") {
+    if (operationLookupStatus) {
+      return new Response(JSON.stringify({ error: { code: "unauthorized", retryable: false } }), { status: operationLookupStatus });
+    }
     return Response.json({
       id: m[1],
       machineId: "m_x",
@@ -215,6 +292,7 @@ const env = {
   INSTABOX_API_KEY: "ibk_test_key",
   INSTABOX_LEASE_TTL: "900",
   TOKEN: "secret-token",
+  STATE_CACHE: "off",
   LOG: fakeKV(),
   CONFIG: fakeKV(),
 };
@@ -441,9 +519,11 @@ let snapshot;
 {
   await worker.fetch(post("/api/config", { paused: true }, auth), env);
   calls = [];
-  await worker.scheduled({}, env);
+  const out = await worker.scheduled({}, env);
   assert.deepEqual(calls, []);
-  ok("暂停后 scheduled 不发任何请求");
+  assert.equal(out.paused, true);
+  assert.equal(out.ok, false, "暂停不是因为续租成功；不能伪装成 ok=true");
+  ok("暂停后 scheduled 不发请求且不报告成功");
 }
 
 // 17. 手动续租不受暂停影响
@@ -982,6 +1062,7 @@ let snapshot;
     "冷却不该在请求内重试（白花子请求）",
   );
   delete cooldowns.m_2;
+  machineState.m_2 = "suspended";
   ok("machine_cooldown 不再盲重试，改成上报冷却时长");
 }
 
@@ -1001,6 +1082,7 @@ let snapshot;
   await worker.scheduled({}, e);
   assert.equal(hooks.length, 0, "冷却期间不该报警");
   delete cooldowns.m_2;
+  machineState.m_2 = "suspended";
   ok("冷却期间不告警（不把平台限制当故障）");
 }
 
@@ -1014,6 +1096,7 @@ let snapshot;
   assert.ok(m2.cooldownUntil, "/status 要带 cooldownUntil");
   assert.equal(m2.autoSuspendedAt, null, "手动挂起的不该有 autoSuspendedAt");
   delete cooldowns.m_2;
+  machineState.m_2 = "suspended";
   ok("/status 带 cooldownUntil，看得出是不是在冷却");
 }
 
@@ -1048,6 +1131,20 @@ let snapshot;
   assert.equal(body.ok, true, "operation_conflict 应该被重试掉，不该记成失败");
   assert.equal(puts, 2, "第一次 409 + 第二次成功");
   ok("409 operation_conflict 会重试，不再记成失败");
+}
+
+// 429 的 Retry-After 超过 5 秒时：不提前重试，直接留给下一轮。
+{
+  const e = { ...env, INSTABOX_MACHINE: "m_1", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_1 = "running";
+  leaseSlowRate = 1;
+  const before = calls.length;
+  const out = await (await worker.fetch(post("/api/renew", {}, auth), e)).json();
+  const puts = calls.slice(before).filter((c) => c.includes("activity-leases")).length;
+  assert.equal(puts, 1, "Retry-After=60 时本轮只打一次，不能盲重试");
+  assert.equal(out.machines[0].limit, "throttled");
+  leaseSlowRate = 0;
+  ok("Retry-After 超过本轮预算时不盲重试");
 }
 
 // 429 带 retryAfterSeconds：按服务端给的秒数等，而不是固定 400ms 硬撞
@@ -1104,7 +1201,7 @@ const winConf = (win) => JSON.stringify({ v: 1, paused: false, window: win, acco
   const out = await worker.scheduled({}, e);
   const made = calls.slice(before);
   assert.ok(!made.some((c) => c.startsWith("PUT /v1/machines/")), "区间外不该续租");
-  assert.equal(JSON.parse(e.CONFIG._map.get("win")).phase, "idle");
+  assert.equal(JSON.parse(e.CONFIG._map.get("win")).machines["1:m_1"].phase, "idle");
   ok("保活区间外不续租，状态记为 idle");
 }
 
@@ -1136,6 +1233,10 @@ const winConf = (win) => JSON.stringify({ v: 1, paused: false, window: win, acco
   const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
   machineState.m_1 = "running";
   machineState.m_2 = "running";
+  // 前面的冷却/挂起用例会留下测试状态；本用例只验证窗口逻辑，显式清掉。
+  delete cooldowns.m_2;
+  delete machineExtra.m_2;
+  autoPaused.delete("m_2");
   const w = windowIncludingNow();
   e.CONFIG._map.set("config", winConf({ on: true, ...w, maxMin: 0 }));
   const before = calls.length;
@@ -1654,6 +1755,23 @@ const sentText = () => (lastTg()?.body?.text || "");
   ok("Telegram webhook 路径/secret 头不对一律 403");
 }
 
+// 1.1 Telegram 429 自动重试一次：第一次失败，第二次成功，不能静默丢掉用户命令。
+{
+  const e = tgEnv();
+  tgCalls.length = 0;
+  tgRateLimit = 1;
+  try {
+    const res = await worker.fetch(tgPost(msgUpdate("/id")), e);
+    assert.equal(res.status, 200);
+    const sends = tgCalls.filter((c) => c.method === "sendMessage");
+    assert.equal(sends.length, 2, "429 后应该重试 sendMessage");
+    assert.match(sends[1].body.text, /chat id/);
+  } finally {
+    tgRateLimit = 0;
+  }
+  ok("Telegram 429 自动重试一次");
+}
+
 // 2. 没配 TELEGRAM_BOT_TOKEN 时不接活
 {
   const res = await worker.fetch(tgPost(msgUpdate("/ls")), tgEnv({ TELEGRAM_BOT_TOKEN: "" }));
@@ -1783,6 +1901,7 @@ const sentText = () => (lastTg()?.body?.text || "");
   assert.match(sentText(), /冷却/);
   assert.match(sentText(), /10 分钟/);
   delete cooldowns.m_2;
+  machineState.m_2 = "suspended";
   ok("/wake 遇到冷却回执带剩余时间");
 }
 
@@ -2073,12 +2192,75 @@ const sentText = () => (lastTg()?.body?.text || "");
   ok("回调按钮：详情 → 休眠 全链路走通");
 }
 
-// 10. /pause on 写全局暂停
+// 10. /pause on/off：写暂停来源，回执讲清楚风险和恢复方式
 {
   const e = tgEnv();
+  machineState.m_1 = "running";
+  tgCalls.length = 0;
   await worker.fetch(tgPost(msgUpdate("/pause on")), e);
-  assert.equal(JSON.parse(e.CONFIG._map.get("config")).paused, true);
-  ok("/pause on 全局暂停保活");
+  const conf = JSON.parse(e.CONFIG._map.get("config"));
+  assert.equal(conf.paused, true);
+  assert.equal(conf.pausedBy, "telegram");
+  assert.ok(Date.parse(conf.pausedAt) > 0, "暂停必须带时间，便于追查");
+  assert.match(sentText(), /暂停/);
+  assert.match(sentText(), /到期后机器会休眠/);
+  assert.match(sentText(), /\/pause off/);
+
+  tgCalls.length = 0;
+  await worker.fetch(tgPost(msgUpdate("/pause off")), e);
+  const resumed = JSON.parse(e.CONFIG._map.get("config"));
+  assert.equal(resumed.paused, false);
+  assert.equal(resumed.pausedAt, null);
+  assert.equal(resumed.pausedBy, "");
+  assert.match(sentText(), /下一轮 cron/);
+  assert.match(sentText(), /\/renew/);
+  ok("/pause on/off 记录来源并明确恢复方式");
+}
+
+// 10.1 /ls 的暂停摘要必须显示来源和时间；恢复后显示最近成功续租
+{
+  const e = tgEnv();
+  e.CONFIG._map.set("config", JSON.stringify({
+    v: 2,
+    paused: true,
+    pausedAt: "2026-11-05T16:49:44.756Z",
+    pausedBy: "telegram",
+    accounts: {},
+  }));
+  e.CONFIG._map.set("live", JSON.stringify({
+    at: "2026-11-05T16:49:44.756Z",
+    lastLeaseAt: "2026-11-05T16:49:44.756Z",
+    machines: [],
+  }));
+  tgCalls.length = 0;
+  await worker.fetch(tgPost(msgUpdate("/ls")), e);
+  assert.match(sentText(), /已全局暂停/);
+  assert.match(sentText(), /来源 telegram/);
+  assert.match(sentText(), /2026-11-06 00:49/);
+  assert.match(sentText(), /到期后机器会休眠/);
+
+  e.CONFIG._map.set("config", JSON.stringify({ v: 2, paused: false, accounts: {} }));
+  tgCalls.length = 0;
+  await worker.fetch(tgPost(msgUpdate("/ls")), e);
+  assert.match(sentText(), /最近成功续租/);
+  assert.match(sentText(), /2026-11-06 00:49/);
+  ok("Telegram 摘要显示暂停审计和最近成功续租");
+}
+
+// 10.2 Telegram /renew 必须推进 live.lastLeaseAt，健康检查不能误报
+{
+  const e = tgEnv();
+  e.CONFIG._map.set("config", JSON.stringify({ v: 2, paused: false, accounts: {} }));
+  e.CONFIG._map.set("live", JSON.stringify({ at: "2026-01-01T00:00:00.000Z", lastLeaseAt: null, machines: [] }));
+  machineState.m_1 = "running";
+  tgCalls.length = 0;
+  await worker.fetch(tgPost(msgUpdate("/renew qqq")), e);
+  assert.match(sentText(), /已续租/);
+  assert.match(sentText(), /心跳已更新/);
+  const live = JSON.parse(e.CONFIG._map.get("live"));
+  assert.ok(Date.parse(live.lastLeaseAt) > 0, "/renew 必须推进 lastLeaseAt");
+  assert.ok(Date.parse(live.at) > 0);
+  ok("Telegram /renew 推进 lastLeaseAt");
 }
 
 // 11. 注册 webhook：带上 secret_token，且 /api/telegram 需要凭据
@@ -2093,7 +2275,13 @@ const sentText = () => (lastTg()?.body?.text || "");
   assert.ok(set, "应该调用 setWebhook");
   assert.equal(set.body.url, "https://worker.test/tg/s3cret");
   assert.equal(set.body.secret_token, "s3cret");
-  ok("/api/telegram?action=set 注册 webhook（带 secret_token，且需凭据）");
+  const setBody = await res.json();
+  assert.equal(setBody.url, "https://worker.test/tg/***", "返回给面板的 webhook URL 必须脱敏");
+  const info = await worker.fetch(req("/api/telegram?action=info", { headers: auth }), e);
+  const infoBody = await info.json();
+  assert.equal(infoBody.telegram.result.url, "https://worker.test/tg/***", "getWebhookInfo 返回必须脱敏");
+  assert.equal(JSON.stringify(infoBody).includes("s3cret"), false, "webhook secret 不能进入管理接口响应");
+  ok("/api/telegram?action=set 注册 webhook（带 secret_token、需凭据，响应脱敏）");
 }
 
 // 12. 网页里配 bot：存进 CONFIG，接口只回打码值
@@ -2355,6 +2543,767 @@ const sentText = () => (lastTg()?.body?.text || "");
   assert.equal(m1.free, true);
   delete machineExtra.m_1;
   ok("/api/state 带 runStartedAt / maxRunMinutes / free");
+}
+
+// ---- 暂停可观测性与健康检查 ------------------------------------------------
+
+// 暂停必须留下来源和时间，cron 仍然不碰 InstaBox API，但不能再是“无痕成功”。
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_1 = "running";
+  machineState.m_2 = "running";
+  const saved = await worker.fetch(post("/api/config", { paused: true, pausedBy: "panel" }, auth), e);
+  assert.equal(saved.status, 200);
+  const conf = JSON.parse(e.CONFIG._map.get("config"));
+  assert.equal(conf.paused, true);
+  assert.equal(conf.pausedBy, "panel");
+  assert.ok(Date.parse(conf.pausedAt) > 0, "pausedAt 应是有效时间");
+
+  calls = [];
+  const out = await worker.scheduled({}, e);
+  assert.deepEqual(calls, [], "暂停时不能调用 InstaBox");
+  assert.equal(out.paused, true);
+  assert.equal(out.pausedBy, "panel");
+  assert.equal(out.pausedAt, conf.pausedAt);
+  ok("暂停记录来源和时间，cron 不调用 InstaBox");
+}
+
+// 暂停时健康检查必须返回 503 + paused，而不是 200。
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  e.CONFIG._map.set("config", JSON.stringify({
+    v: 2,
+    paused: true,
+    pausedAt: "2026-11-05T16:49:44.756Z",
+    pausedBy: "telegram",
+    accounts: {},
+  }));
+  e.CONFIG._map.set("live", JSON.stringify({ at: "2026-11-05T16:49:44.756Z", lastLeaseAt: "2026-11-05T16:49:44.756Z", machines: [] }));
+  const r = await worker.fetch(req("/api/health", { headers: auth }), e);
+  assert.equal(r.status, 503);
+  const h = await r.json();
+  assert.equal(h.ok, false);
+  assert.equal(h.status, "paused");
+  assert.equal(h.reason, "keepalive_paused");
+  assert.equal(h.pausedBy, "telegram");
+  assert.match(h.error, /暂停/);
+  ok("/api/health 把暂停判为 degraded（503）");
+}
+
+// 恢复后心跳正常则健康；暂停字段被清空，旧配置仍可读。
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  e.CONFIG._map.set("config", JSON.stringify({ v: 2, paused: false, accounts: {} }));
+  e.CONFIG._map.set("live", JSON.stringify({
+    at: new Date().toISOString(),
+    lastLeaseAt: new Date().toISOString(),
+    machines: [{ account: 1, id: "m_1", ok: true, expiresAt: new Date(Date.now() + 60_000).toISOString() }],
+  }));
+  const r = await worker.fetch(req("/api/health", { headers: auth }), e);
+  assert.equal(r.status, 200);
+  const h = await r.json();
+  assert.equal(h.ok, true);
+  assert.equal(h.status, "ok");
+  assert.equal(h.pausedAt, null);
+  ok("/api/health 在心跳新鲜时返回 200；旧配置兼容");
+}
+
+// 心跳过期必须暴露，不能继续显示健康。
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  e.CONFIG._map.set("config", JSON.stringify({ v: 2, paused: false, accounts: {} }));
+  e.CONFIG._map.set("live", JSON.stringify({ at: "2026-01-01T00:00:00.000Z", lastLeaseAt: "2026-01-01T00:00:00.000Z", machines: [] }));
+  const r = await worker.fetch(req("/api/health", { headers: auth }), e);
+  assert.equal(r.status, 503);
+  const h = await r.json();
+  assert.equal(h.status, "stale");
+  assert.equal(h.reason, "heartbeat_stale");
+  ok("/api/health 检测到心跳过期（503）");
+}
+
+// 手动单台续租要推进 lastLeaseAt，避免面板显示健康而租约其实没续。
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  e.CONFIG._map.set("config", JSON.stringify({ v: 2, paused: false, accounts: {} }));
+  e.CONFIG._map.set("live", JSON.stringify({ at: "2026-01-01T00:00:00.000Z", lastLeaseAt: null, machines: [] }));
+  machineState.m_1 = "running";
+  const r = await worker.fetch(post("/api/machine", { account: 1, id: "m_1", action: "renew" }, auth), e);
+  assert.equal(r.status, 200);
+  const live = JSON.parse(e.CONFIG._map.get("live"));
+  assert.ok(Date.parse(live.lastLeaseAt) > 0, "单台手动续租应推进 lastLeaseAt");
+  ok("手动单台续租推进 lastLeaseAt");
+}
+
+// 执行了但所有续租都失败：不能因为 live.at 新鲜就显示健康。
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  const now = new Date().toISOString();
+  e.CONFIG._map.set("config", JSON.stringify({ v: 2, paused: false, accounts: {} }));
+  e.CONFIG._map.set("live", JSON.stringify({ at: now, lastLeaseAt: "2026-01-01T00:00:00.000Z", machines: [] }));
+  const r = await worker.fetch(req("/api/health", { headers: auth }), e);
+  assert.equal(r.status, 503);
+  const h = await r.json();
+  assert.equal(h.status, "no_recent_lease");
+  assert.equal(h.reason, "no_recent_lease");
+  ok("/api/health 持续续租失败时返回 no_recent_lease");
+}
+
+// 全局暂停时 /wake 仍可临时唤醒，但必须明确告知 cron 不会接手。
+{
+  const e = tgEnv();
+  machineState.m_1 = "running";
+  e.CONFIG._map.set("config", JSON.stringify({
+    v: 2,
+    paused: true,
+    pausedAt: "2026-11-05T16:49:44.756Z",
+    pausedBy: "telegram",
+    accounts: {},
+  }));
+  tgCalls.length = 0;
+  await worker.fetch(tgPost(msgUpdate("/wake qqq")), e);
+  assert.match(sentText(), /已唤醒/);
+  assert.match(sentText(), /全局保活仍暂停/);
+  assert.match(sentText(), /\/pause off/);
+  ok("Telegram /wake 在全局暂停时提示 cron 不会接手");
+}
+
+// /release 之后不能继续把旧的成功续租当成健康：单台释放要清 lastLeaseAt。
+{
+  const e = tgEnv();
+  machineState.m_1 = "running";
+  e.CONFIG._map.set("config", JSON.stringify({ v: 2, paused: false, accounts: {} }));
+  e.CONFIG._map.set("live", JSON.stringify({
+    at: new Date().toISOString(),
+    lastLeaseAt: new Date().toISOString(),
+    machines: [{ account: 1, id: "m_1", name: "qqq", ok: true, expiresAt: new Date(Date.now() + 900000).toISOString() }],
+  }));
+  tgCalls.length = 0;
+  await worker.fetch(tgPost(msgUpdate("/release qqq")), e);
+  assert.match(sentText(), /租约已释放/);
+  assert.match(sentText(), /下一轮 cron 会重新续租/);
+  const live = JSON.parse(e.CONFIG._map.get("live"));
+  assert.equal(live.lastLeaseAt, null, "释放后不应保留旧 lease 心跳");
+  assert.equal(live.machines.find((m) => m.id === "m_1").expiresAt, null);
+  ok("Telegram /release 清空 lease 心跳和到期时间");
+}
+
+// /sleep 和 /stop 也会释放租约，健康心跳不能留在“最近成功续租”。
+{
+  const e = tgEnv();
+  machineState.m_1 = "running";
+  e.CONFIG._map.set("config", JSON.stringify({ v: 2, paused: false, accounts: {} }));
+  e.CONFIG._map.set("live", JSON.stringify({
+    at: new Date().toISOString(),
+    lastLeaseAt: new Date().toISOString(),
+    machines: [{ account: 1, id: "m_1", name: "qqq", ok: true, expiresAt: new Date(Date.now() + 900000).toISOString() }],
+  }));
+  tgCalls.length = 0;
+  await worker.fetch(tgPost(msgUpdate("/sleep qqq")), e);
+  assert.match(sentText(), /已休眠/);
+  const live = JSON.parse(e.CONFIG._map.get("live"));
+  assert.equal(live.lastLeaseAt, null, "休眠释放租约后不应保留旧 lease 心跳");
+  assert.equal(live.machines.find((m) => m.id === "m_1").expiresAt, null);
+  machineState.m_1 = "running";
+  ok("Telegram /sleep 清空 lease 心跳和到期时间");
+}
+
+// 网页面板/API 的单台释放与 Telegram /release 必须同一心跳语义。
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_1 = "running";
+  e.CONFIG._map.set("config", JSON.stringify({ v: 2, paused: false, accounts: {} }));
+  e.CONFIG._map.set("live", JSON.stringify({
+    at: new Date().toISOString(),
+    lastLeaseAt: new Date().toISOString(),
+    machines: [{ account: 1, id: "m_1", name: "qqq", ok: true, expiresAt: new Date(Date.now() + 900000).toISOString() }],
+  }));
+  const r = await worker.fetch(post("/api/machine", { account: 1, id: "m_1", action: "release" }, auth), e);
+  assert.equal(r.status, 200);
+  const live = JSON.parse(e.CONFIG._map.get("live"));
+  assert.equal(live.lastLeaseAt, null);
+  assert.equal(live.machines.find((m) => m.id === "m_1").expiresAt, null);
+  machineState.m_1 = "running";
+  ok("面板/API 单台释放清空 lease 心跳");
+}
+
+// 全局暂停时 /renew 也要明确说明 cron 不接手；/release 不能暗示会自动续租。
+{
+  const e = tgEnv();
+  machineState.m_1 = "running";
+  e.CONFIG._map.set("config", JSON.stringify({
+    v: 2,
+    paused: true,
+    pausedAt: "2026-11-05T16:49:44.756Z",
+    pausedBy: "telegram",
+    accounts: {},
+  }));
+  tgCalls.length = 0;
+  await worker.fetch(tgPost(msgUpdate("/renew qqq")), e);
+  assert.match(sentText(), /已续租/);
+  assert.match(sentText(), /全局保活仍暂停/);
+
+  tgCalls.length = 0;
+  await worker.fetch(tgPost(msgUpdate("/release qqq")), e);
+  assert.match(sentText(), /全局保活已暂停/);
+  assert.doesNotMatch(sentText(), /下一轮 cron 会重新续租/);
+  ok("Telegram /renew 与 /release 在全局暂停时给出正确预期");
+}
+
+// 旧 paused=true 缺审计字段时，再次 /pause on 要补齐来源和时间。
+{
+  const e = tgEnv();
+  e.CONFIG._map.set("config", JSON.stringify({ v: 2, paused: true, accounts: {} }));
+  await worker.fetch(tgPost(msgUpdate("/pause on")), e);
+  const conf = JSON.parse(e.CONFIG._map.get("config"));
+  assert.ok(Date.parse(conf.pausedAt) > 0);
+  assert.equal(conf.pausedBy, "telegram");
+  ok("旧暂停配置再次 /pause on 时补齐审计字段");
+}
+
+// 已知 coolingUntil 时不再发 PUT，避免每轮白花请求。
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_2 = "suspended";
+  cooldowns.m_2 = 600;
+  const before = calls.length;
+  await worker.scheduled({}, e);
+  const made = calls.slice(before);
+  assert.ok(!made.some((c) => c.startsWith("PUT /v1/machines/m_2/activity-leases/")), "冷却中不该再打 PUT lease");
+  delete cooldowns.m_2;
+  machineState.m_2 = "suspended";
+  ok("已知冷却时直接跳过，不浪费续租请求");
+}
+
+// 小预算下多台机器轮转：连续几轮不能总是同一台先拿额度。
+{
+  const e = { ...env, INSTABOX_MACHINE: "m_1,m_2", SUBREQUEST_LIMIT: "10", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_1 = "running";
+  machineState.m_2 = "running";
+  const seen = [];
+  for (let i = 0; i < 4; i++) {
+    const before = calls.length;
+    await worker.scheduled({}, e);
+    const made = calls.slice(before);
+    const leased = made.filter((c) => c.startsWith("PUT /v1/machines/")).map((c) => c.split("/")[3]);
+    seen.push(...leased);
+  }
+  assert.ok(seen.includes("m_1"), "m_1 至少应有一次续租机会");
+  assert.ok(seen.includes("m_2"), "m_2 也至少应有一次续租机会");
+  ok("小预算多机轮转，不饿死后面的机器");
+}
+
+// 短 TTL（比如 300 秒）只要实际 lease 仍在有效期内，就应判健康。
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  e.CONFIG._map.set("config", JSON.stringify({ v: 2, paused: false, accounts: {} }));
+  e.CONFIG._map.set("live", JSON.stringify({
+    at: new Date().toISOString(),
+    lastLeaseAt: new Date().toISOString(),
+    machines: [{ account: 1, id: "m_1", ok: true, expiresAt: new Date(Date.now() + 120_000).toISOString() }],
+  }));
+  const r = await worker.fetch(req("/api/health", { headers: auth }), e);
+  assert.equal(r.status, 200);
+  assert.equal((await r.json()).status, "ok");
+  ok("/api/health 尊重短 TTL 的有效 lease");
+}
+
+// 平台状态不是普通失败：max_run_disabled 要带恢复动作。
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_2 = "suspended";
+  autoPaused.delete("m_2");
+  lifecycleMaxRunDisabled = 1;
+  leaseConflicts = 0;
+  const out = await (await worker.fetch(post("/api/renew", {}, auth), e)).json();
+  const m2 = out.machines.find((m) => m.id === "m_2");
+  assert.equal(m2.limit, "max_run_disabled", JSON.stringify(m2));
+  assert.match(m2.error, /max-run/);
+  machineState.m_2 = "suspended";
+  lifecycleMaxRunDisabled = 0;
+  ok("max_run_disabled 被识别为平台限制");
+}
+
+// quota_exceeded 是 429 中独立的一类，不能和普通启动限流混在一起。
+{
+  const e = { ...env, INSTABOX_MACHINE: "m_2", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_2 = "suspended";
+  // 让 PUT lease 返回 429 quota_exceeded（leaseLimit 模拟层）。
+  leaseQuota = 3;
+  const out = await (await worker.fetch(post("/api/renew", {}, auth), e)).json();
+  const m2 = out.machines.find((m) => m.id === "m_2");
+  assert.equal(m2.limit, "quota_exceeded", JSON.stringify(m2));
+  assert.match(m2.error, /配额|并发/);
+  machineState.m_2 = "suspended";
+  leaseQuota = 0;
+  ok("quota_exceeded 被识别为平台限制");
+}
+
+// 新机器下一轮必须被发现；旧实现 10 分钟缓存会漏保。
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  includeExtraMachine = false;
+  machineState.m_1 = "running";
+  machineState.m_2 = "running";
+  await worker.scheduled({}, e);
+  includeExtraMachine = true;
+  const before = calls.length;
+  await worker.scheduled({}, e);
+  const made = calls.slice(before);
+  assert.ok(made.includes("PUT /v1/machines/m_new/activity-leases/keepalive"), "前一轮之后新建的机器，下一轮必须被发现并续租");
+  includeExtraMachine = false;
+  ok("新机器下一轮被发现，不被列表缓存漏保");
+}
+
+// Web/Telegram 展示 max-run=0 的恢复动作。
+{
+  const e = tgEnv();
+  machineState.m_1 = "suspended";
+  machineExtra.m_1 = { maxRunMinutes: 0, runStartedAt: null };
+  tgCalls.length = 0;
+  await worker.fetch(tgPost(cbUpdate("d:1:m_1")), e);
+  assert.match(lastTg().body.text, /max-run 已禁用/);
+  assert.match(lastTg().body.text, /改回可运行设置/);
+  delete machineExtra.m_1;
+  machineState.m_1 = "running";
+  ok("Telegram 展示 max-run 禁用状态");
+}
+
+// 外部监控可用独立 HEALTH_TOKEN，不需要面板会话；无 token 仍然 401。
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV(), HEALTH_TOKEN: "health-secret" };
+  e.CONFIG._map.set("config", JSON.stringify({ v: 2, paused: false, accounts: {} }));
+  e.CONFIG._map.set("live", JSON.stringify({
+    at: new Date().toISOString(),
+    lastLeaseAt: new Date().toISOString(),
+    machines: [{ account: 1, id: "m_1", ok: true, expiresAt: new Date(Date.now() + 120_000).toISOString() }],
+  }));
+  const noToken = await worker.fetch(req("/api/health"), e);
+  assert.equal(noToken.status, 401, "没有 HEALTH_TOKEN 时不能公开健康检查");
+  const bad = await worker.fetch(req("/api/health", { headers: { "x-health-token": "wrong" } }), e);
+  assert.equal(bad.status, 401);
+  const good = await worker.fetch(req("/api/health", { headers: { "x-health-token": "health-secret" } }), e);
+  assert.equal(good.status, 200);
+  const q = await worker.fetch(req("/api/health?health_token=health-secret"), e);
+  assert.equal(q.status, 200);
+  ok("HEALTH_TOKEN 支持外部监控，错误/缺失仍 401");
+}
+
+// 唤醒成功但续租失败：必须显示“部分成功”，不能把机器算作已保活。
+// 让 resume 成功、随后 lease 的每次尝试都失败（3 次），覆盖 leaseAfterWake。
+{
+  const e = { ...env, INSTABOX_MACHINE: "m_2", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_2 = "suspended";
+  autoPaused.add("m_2");
+  const originalFetch = globalThis.fetch;
+  let leaseCalls = 0;
+  globalThis.fetch = async (input, init = {}) => {
+    const url = new URL(String(input));
+    const method = (init.method || "GET").toUpperCase();
+    if (url.pathname.includes("/activity-leases/") && method === "PUT") {
+      leaseCalls++;
+      // 第一次 PUT 让流程进入唤醒；唤醒后的 lease 再连续失败到重试耗尽。
+      if (leaseCalls === 1) {
+        return new Response(JSON.stringify({ error: "machine_not_running" }), { status: 409 });
+      }
+      return new Response(JSON.stringify({ error: { code: "quota_exceeded", retryable: true, retryAfterSeconds: 0.01 } }), { status: 429 });
+    }
+    return originalFetch(input, init);
+  };
+  try {
+    const out = await (await worker.fetch(post("/api/renew", {}, auth), e)).json();
+    const m2 = out.machines.find((m) => m.id === "m_2");
+    assert.equal(leaseCalls, 4, "首次探测 + 唤醒后 3 次 lease 重试");
+    assert.equal(m2.resumed, true, JSON.stringify(m2));
+    assert.equal(m2.wakeFailed, false, JSON.stringify(m2));
+    assert.match(m2.error, /已唤醒，但续租失败/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    machineState.m_2 = "suspended";
+    autoPaused.delete("m_2");
+  }
+  ok("唤醒成功但 lease 失败被明确标记");
+}
+
+// 平台限制要持久化到 live，并让健康检查返回 limited，而不是 generic failure。
+{
+  const e = { ...env, INSTABOX_MACHINE: "m_2", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_2 = "suspended";
+  autoPaused.delete("m_2");
+  lifecycleMaxRunDisabled = 1;
+  leaseConflicts = 0;
+  await worker.fetch(post("/api/renew", {}, auth), e);
+  const live = JSON.parse(e.CONFIG._map.get("live"));
+  const row = live.machines.find((m) => m.id === "m_2");
+  assert.equal(row.limit, "max_run_disabled", JSON.stringify(row));
+  const h = await (await worker.fetch(req("/api/health", { headers: auth }), e)).json();
+  assert.equal(h.status, "limited");
+  assert.equal(h.reason, "platform_limited");
+  assert.match(h.error, /平台冷却|配额|max-run/);
+  machineState.m_2 = "suspended";
+  lifecycleMaxRunDisabled = 0;
+  ok("平台限制进入 live 并被 /api/health 识别为 limited");
+}
+
+// Telegram 摘要要显示平台限制数量，不能只有机器详情里能看到。
+{
+  const e = tgEnv();
+  machineState.m_1 = "running";
+  e.CONFIG._map.set("config", JSON.stringify({ v: 2, paused: false, accounts: {} }));
+  e.CONFIG._map.set("live", JSON.stringify({
+    at: new Date().toISOString(),
+    lastLeaseAt: new Date().toISOString(),
+    machines: [
+      { account: 1, id: "m_1", name: "qqq", ok: true, expiresAt: new Date(Date.now() + 60000).toISOString() },
+      { account: 1, id: "m_2", name: "box2", ok: false, expiresAt: null, limit: "max_run_disabled", reason: "" },
+    ],
+  }));
+  tgCalls.length = 0;
+  await worker.fetch(tgPost(msgUpdate("/ls")), e);
+  assert.match(sentText(), /1 台受平台限制/);
+  ok("Telegram 摘要显示平台限制数量");
+}
+
+// 离开窗口时 DELETE 失败：这一轮必须报错且保留 keep，下一轮重试释放，不能假装 idle。
+{
+  const e = { ...env, INSTABOX_MACHINE: "m_1", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_1 = "running";
+  const w = windowExcludingNow();
+  e.CONFIG._map.set("config", winConf({ on: true, ...w, maxMin: 0 }));
+  e.CONFIG._map.set("win", JSON.stringify({ phase: "keep", startedAt: new Date().toISOString() }));
+  leaseDeleteFailures = 3; // call() 的两次重试都失败
+  // /api/renew 是 force，会跳过窗口；这里必须走 cron 语义。
+  const first = await worker.scheduled({}, e);
+  assert.equal(first.machines[0].ok, false);
+  assert.match(first.machines[0].error, /释放租约失败/);
+  const winState = JSON.parse(e.CONFIG._map.get("win"));
+  assert.equal(winState.machines["1:m_1"].phase, "keep", "释放失败不应写成 idle");
+  leaseDeleteFailures = 0;
+  const before = calls.length;
+  await worker.scheduled({}, e);
+  assert.ok(calls.slice(before).some((c) => c.startsWith("DELETE /v1/machines/m_1/activity-leases/")), "下一轮应重试 DELETE");
+  assert.equal(JSON.parse(e.CONFIG._map.get("win")).phase, "idle");
+  machineState.m_1 = "running";
+  ok("离开窗口释放失败时保留状态并在下一轮重试");
+}
+
+// /api/renew 在暂停时 force 执行，结果不能带 paused 假语义。
+{
+  const e = { ...env, INSTABOX_MACHINE: "m_1", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_1 = "running";
+  e.CONFIG._map.set("config", JSON.stringify({ v: 2, paused: true, accounts: {} }));
+  const out = await (await worker.fetch(post("/api/renew", {}, auth), e)).json();
+  assert.equal(out.ok, true, "手动 force 续租成功应保持 ok=true");
+  assert.equal(out.paused, undefined, "force 执行不是暂停结果");
+  ok("暂停中的手动 /api/renew 区分于 cron 暂停结果");
+}
+
+// 多机健康不能被一台健康机器掩盖：任一受管机器失败/过期都要报异常。
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  e.CONFIG._map.set("config", JSON.stringify({ v: 2, paused: false, accounts: {} }));
+  e.CONFIG._map.set("live", JSON.stringify({
+    at: new Date().toISOString(),
+    lastLeaseAt: new Date().toISOString(),
+    machines: [
+      { account: 1, id: "m_1", ok: true, expiresAt: new Date(Date.now() + 120000).toISOString() },
+      { account: 1, id: "m_2", ok: false, expiresAt: null },
+    ],
+  }));
+  const r = await worker.fetch(req("/api/health", { headers: auth }), e);
+  assert.equal(r.status, 503);
+  const h = await r.json();
+  assert.equal(h.status, "no_recent_lease");
+  assert.equal(h.reason, "no_recent_lease");
+  ok("多机健康会报告任一受管机器失败");
+}
+
+// 区间外主动 skipped 的机器不应让健康误报。
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  e.CONFIG._map.set("config", JSON.stringify({ v: 2, paused: false, accounts: {} }));
+  e.CONFIG._map.set("live", JSON.stringify({
+    at: new Date().toISOString(),
+    lastLeaseAt: new Date().toISOString(),
+    machines: [
+      { account: 1, id: "m_1", ok: true, expiresAt: null, skipped: "不在保活区间" },
+    ],
+  }));
+  const h = await (await worker.fetch(req("/api/health", { headers: auth }), e)).json();
+  assert.equal(h.status, "ok", JSON.stringify(h));
+  ok("区间外主动跳过的机器不会被健康误报");
+}
+
+// Telegram /sleep 如果 DELETE 失败，不能清 live 心跳，也不能回报完全成功。
+{
+  const e = tgEnv();
+  machineState.m_1 = "running";
+  e.CONFIG._map.set("config", JSON.stringify({ v: 2, paused: false, accounts: {} }));
+  e.CONFIG._map.set("live", JSON.stringify({
+    at: new Date().toISOString(),
+    lastLeaseAt: new Date().toISOString(),
+    machines: [{ account: 1, id: "m_1", name: "qqq", ok: true, expiresAt: new Date(Date.now() + 900000).toISOString() }],
+  }));
+  leaseDeleteFailures = 3;
+  tgCalls.length = 0;
+  await worker.fetch(tgPost(msgUpdate("/sleep qqq")), e);
+  assert.match(sentText(), /租约释放失败/);
+  const live = JSON.parse(e.CONFIG._map.get("live"));
+  assert.equal(live.lastLeaseAt, new Date(live.lastLeaseAt).toISOString());
+  assert.ok(live.machines.find((m) => m.id === "m_1").expiresAt);
+  leaseDeleteFailures = 0;
+  machineState.m_1 = "running";
+  ok("Telegram /sleep 释放失败时保留心跳并如实报错");
+}
+
+// 生命周期请求遇到长 Retry-After 时也只打一次，不能把启动限流越撞越糟。
+{
+  const e = { ...env, INSTABOX_MACHINE: "m_2", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_2 = "suspended";
+  autoPaused.delete("m_2");
+  lifecycleSlowRetry = 1;
+  leaseConflicts = 0;
+  const before = calls.length;
+  await worker.fetch(post("/api/renew", {}, auth), e);
+  const made = calls.slice(before);
+  assert.equal(made.filter((c) => c.startsWith("POST /v1/machines/m_2/resume")).length, 1, "长 Retry-After 不应提前重试");
+  lifecycleSlowRetry = 0;
+  machineState.m_2 = "suspended";
+  ok("act 遇到长 Retry-After 不盲重试");
+}
+
+// Telegram /wake 成功后必须立即推进 live 心跳，不能让面板/健康等下一轮。
+{
+  const e = tgEnv();
+  machineState.m_1 = "running";
+  e.CONFIG._map.set("config", JSON.stringify({ v: 2, paused: false, accounts: {} }));
+  e.CONFIG._map.set("live", JSON.stringify({ at: "2026-01-01T00:00:00.000Z", lastLeaseAt: null, machines: [] }));
+  tgCalls.length = 0;
+  await worker.fetch(tgPost(msgUpdate("/wake qqq")), e);
+  assert.match(sentText(), /已唤醒/);
+  const live = JSON.parse(e.CONFIG._map.get("live"));
+  assert.ok(Date.parse(live.lastLeaseAt) > 0, "wake 成功应立即写 lease 心跳");
+  assert.ok(live.machines.find((m) => m.id === "m_1").expiresAt);
+  ok("Telegram /wake 立即刷新 live 心跳");
+}
+
+// waitOp 的确定性读取失败不能被当成“还在进行中”。
+{
+  const e = { ...env, INSTABOX_MACHINE: "m_2", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_2 = "suspended";
+  autoPaused.delete("m_2");
+  operationLookupStatus = 403;
+  const out = await (await worker.fetch(post("/api/renew", {}, auth), e)).json();
+  const m2 = out.machines.find((m) => m.id === "m_2");
+  assert.equal(m2.ok, false);
+  assert.match(m2.error, /查操作失败|403/);
+  operationLookupStatus = 0;
+  machineState.m_2 = "suspended";
+  ok("waitOp 确定性读取失败不被当成超时");
+}
+
+// 机器列表读取失败时，/api/state 不能报告 ok=true。
+{
+  const e = { ...env, INSTABOX_API_KEY: "bad-key", CONFIG: fakeKV(), LOG: fakeKV() };
+  const r = await worker.fetch(req("/api/state", { headers: auth }), e);
+  const body = await r.json();
+  assert.equal(r.status, 200, "仍要返回可展示的快照");
+  assert.equal(body.ok, false, "读取失败必须标记为 partial/error");
+  assert.ok(body.warnings.length > 0);
+  ok("/api/state 在机器读取失败时标记 ok=false");
+}
+
+// Telegram 也要提示不完整快照。
+{
+  const e = tgEnv();
+  machineState.m_1 = "running";
+  e.CONFIG._map.set("config", JSON.stringify({ v: 2, paused: false, accounts: {} }));
+  e.CONFIG._map.set("live", JSON.stringify({ at: new Date().toISOString(), lastLeaseAt: new Date().toISOString(), machines: [] }));
+  const bad = { ...e, INSTABOX_API_KEY: "bad-key" };
+  tgCalls.length = 0;
+  await worker.fetch(tgPost(msgUpdate("/ls")), bad);
+  assert.match(sentText(), /快照不完整/);
+  ok("Telegram 提示不完整快照");
+}
+
+// 分页：最后一页的机器也必须续租，不能只拿第一页。
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_1 = "running";
+  machineState.m_2 = "running";
+  includeExtraMachine = true;
+  paginateMachines = true;
+  const before = calls.length;
+  await worker.scheduled({}, e);
+  const made = calls.slice(before);
+  const listCalls = made.filter((c) => c.startsWith("GET /v1/machines?"));
+  assert.ok(listCalls.length > 0, "分页测试必须实际请求机器列表");
+  for (const one of listCalls) assert.match(one, /[?&]limit=200(?:&|$)/, "机器列表必须使用官方上限 200：" + one);
+  const leased = made.filter((c) => c.startsWith("PUT /v1/machines/")).map((c) => c.split("/")[3]);
+  assert.ok(leased.includes("m_1"));
+  assert.ok(leased.includes("m_2"));
+  assert.ok(leased.includes("m_new"), "第二页的新机器也必须续租");
+  includeExtraMachine = false;
+  paginateMachines = false;
+  ok("机器列表分页后所有页都会续租");
+}
+
+// earlyAllowanceEnded=true 时不应再打 PUT lease；直接报告恢复动作。
+{
+  const e = { ...env, INSTABOX_MACHINE: "m_1", CONFIG: fakeKV(), LOG: fakeKV() };
+  e.CONFIG._map.set("config", winConf({ on: false, start: 0, end: 0, maxMin: 0 }));
+  machineState.m_1 = "suspended";
+  machineExtra.m_1 = { earlyAllowanceEnded: true };
+  const before = calls.length;
+  const out = await worker.scheduled({}, e);
+  const made = calls.slice(before);
+  assert.ok(!made.some((c) => c.startsWith("PUT /v1/machines/m_1/activity-leases/")), "已知额度结束不该再打 PUT");
+  assert.equal(out.machines[0].limit, "blocked", JSON.stringify({ made, out }));
+  assert.match(out.machines[0].error, /免费额度已结束/);
+  delete machineExtra.m_1;
+  machineState.m_1 = "running";
+  ok("earlyAllowanceEnded 短路 402");
+}
+
+// 详情页展示免费额度结束。
+{
+  const e = tgEnv();
+  machineState.m_1 = "suspended";
+  machineExtra.m_1 = { earlyAllowanceEnded: true };
+  tgCalls.length = 0;
+  await worker.fetch(tgPost(cbUpdate("d:1:m_1")), e);
+  assert.match(lastTg().body.text, /免费额度已结束/);
+  delete machineExtra.m_1;
+  machineState.m_1 = "running";
+  ok("Telegram 展示免费额度结束");
+}
+
+// 账号列表读取失败必须持久化到 live.errors，并让健康检查失败。
+{
+  const e = { ...env, INSTABOX_API_KEY: "bad-key", CONFIG: fakeKV(), LOG: fakeKV() };
+  e.CONFIG._map.set("config", JSON.stringify({ v: 2, paused: false, accounts: {} }));
+  await worker.scheduled({}, e);
+  const live = JSON.parse(e.CONFIG._map.get("live"));
+  assert.ok(live.errors.length > 0, JSON.stringify(live));
+  const r = await worker.fetch(req("/api/health", { headers: auth }), e);
+  assert.equal(r.status, 503);
+  const h = await r.json();
+  assert.equal(h.reason, "account_read_failed");
+  assert.ok(h.errors.length > 0);
+  ok("账号读取失败持久化并让健康检查返回 account_read_failed");
+}
+
+// Worker 默认 TTL 必须留出至少 3 倍于 5 分钟 cron 的余量。
+{
+  const e = { ...env, INSTABOX_MACHINE: "m_1", CONFIG: fakeKV(), LOG: fakeKV() };
+  delete e.INSTABOX_LEASE_TTL;
+  machineState.m_1 = "running";
+  const st = await (await worker.fetch(req("/api/state", { headers: auth }), e)).json();
+  assert.equal(st.accounts[0].ttl, 900, "Worker 默认 TTL 应为 900 秒");
+  ok("Worker 默认 TTL 为 900 秒");
+}
+
+// 多账号共享预算：连续轮次应让第二个账号也拿到受管机器资格。
+{
+  const e = { ...env, INSTABOX_API_KEY: "ibk_test_key,ibk_second", INSTABOX_MACHINE: "", SUBREQUEST_LIMIT: "10", CONFIG: fakeKV(), LOG: fakeKV() };
+  machineState.m_1 = "running";
+  machineState.m_2 = "running";
+  machineState.m_3 = "running";
+  const seen = [];
+  for (let i = 0; i < 6; i++) {
+    const before = calls.length;
+    await worker.scheduled({}, e);
+    const made = calls.slice(before);
+    const leased = made.filter((c) => c.startsWith("PUT /v1/machines/")).map((c) => c.split("/")[3]);
+    seen.push(...leased);
+    machineState.m_1 = "running";
+    machineState.m_2 = "running";
+    machineState.m_3 = "running";
+  }
+  assert.ok(seen.includes("m_3"), "多账号预算紧张时第二个账号也不能长期饿死");
+  ok("多账号共享预算轮转");
+}
+
+// Telegram 平台限制回执要区分免费额度与启动限流。
+{
+  const e = tgEnv();
+  machineState.m_2 = "suspended";
+  autoPaused.add("m_2");
+  lifecycle402 = 1;
+  await worker.fetch(tgPost(msgUpdate("/wake box2")), e);
+  assert.match(sentText(), /免费额度/);
+  lifecycle402 = 0;
+
+  lifecycleSlowRetry = 1;
+  tgCalls.length = 0;
+  await worker.fetch(tgPost(msgUpdate("/wake box2")), e);
+  assert.match(sentText(), /启动被平台限流/);
+  lifecycleSlowRetry = 0;
+  autoPaused.delete("m_2");
+  machineState.m_2 = "suspended";
+  ok("Telegram 平台限制回执区分额度与限流");
+}
+
+// 用户主动 suspend/stop（desiredState 明确）时，保活不能自动唤醒。
+{
+  const e = { ...env, INSTABOX_MACHINE: "m_1", CONFIG: fakeKV(), LOG: fakeKV() };
+  e.CONFIG._map.set("config", winConf({ on: false, start: 0, end: 0, maxMin: 0 }));
+  machineState.m_1 = "suspended";
+  machineExtra.m_1 = { desiredState: "suspended", autoSuspendedAt: null };
+  const before = calls.length;
+  const out = await worker.scheduled({}, e);
+  assert.ok(!calls.slice(before).some((c) => c.startsWith("POST /v1/machines/m_1/resume")), "用户主动休眠不应自动 resume");
+  assert.equal(out.machines[0].ok, true);
+  assert.match(out.machines[0].skipped, /用户主动/);
+  delete machineExtra.m_1;
+  machineState.m_1 = "running";
+  ok("用户主动休眠时保活不自动唤醒");
+}
+
+// deep=1 会用真实机器列表接口验证上游合约，而不是只看本地 live 心跳。
+{
+  const e = { ...env, INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV(), HEALTH_TOKEN: "health-token" };
+  e.CONFIG._map.set("config", JSON.stringify({ v: 2, paused: false, accounts: {} }));
+  e.CONFIG._map.set("live", JSON.stringify({
+    at: new Date().toISOString(),
+    lastLeaseAt: new Date().toISOString(),
+    errors: [],
+    machines: [{ account: 1, id: "m_1", ok: true, expiresAt: new Date(Date.now() + 600000).toISOString() }],
+  }));
+  machineState.m_1 = "running";
+  calls = [];
+  const r = await worker.fetch(req("/api/health?deep=1", { headers: { "X-Health-Token": "health-token" } }), e);
+  const h = await r.json();
+  assert.equal(r.status, 200, JSON.stringify(h));
+  assert.equal(h.contract.ok, true, JSON.stringify(h));
+  assert.ok(calls.includes("GET /v1/machines?limit=200"), "deep health 必须验证真实列表合约");
+  ok("deep health 检查真实机器列表合约");
+}
+
+// 合约失败必须把 health 标成 contract_failed，不能被旧 live 心跳掩盖。
+{
+  const e = { ...env, INSTABOX_API_KEY: "ibk_bad", CONFIG: fakeKV(), LOG: fakeKV(), HEALTH_TOKEN: "health-token" };
+  e.CONFIG._map.set("config", JSON.stringify({ v: 2, paused: false, accounts: {} }));
+  const r = await worker.fetch(req("/api/health?deep=1", { headers: { "X-Health-Token": "health-token" } }), e);
+  const h = await r.json();
+  assert.equal(r.status, 503);
+  assert.equal(h.status, "contract_failed");
+  assert.equal(h.contract.ok, false);
+  ok("deep health 把上游合约失败标成 contract_failed");
+}
+
+// /api/state 的短缓存能吸收重复标签页刷新，但 fresh=1 必须绕过缓存。
+{
+  const e = { ...env, STATE_CACHE: "on", INSTABOX_MACHINE: "", CONFIG: fakeKV(), LOG: fakeKV() };
+  calls = [];
+  await worker.fetch(req("/api/state", { headers: auth }), e);
+  const first = calls.filter((c) => c.startsWith("GET /v1/machines?")).length;
+  await worker.fetch(req("/api/state", { headers: auth }), e);
+  const second = calls.filter((c) => c.startsWith("GET /v1/machines?")).length;
+  assert.equal(second, first, "短时间重复 /api/state 应命中缓存");
+  await worker.fetch(req("/api/state?fresh=1", { headers: auth }), e);
+  const third = calls.filter((c) => c.startsWith("GET /v1/machines?")).length;
+  assert.ok(third > second, "fresh=1 应绕过 state 缓存");
+  ok("/api/state 短缓存和 fresh 绕过都正常");
 }
 
 console.log("\n" + passed + " 项通过");

@@ -106,9 +106,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(500, {"error": {"code": "internal", "message": "boom"}})
             if ARGS.scenario == "nolist":
                 note(f"GET {path} 200")
-                return self._send(200, {"machines": []})
+                return self._send(200, {"machines": [], "nextCursor": None})
             note(f"GET {path} 200")
-            return self._send(200, {"machines": [machine_obj(ARGS.machine_id, ARGS.machine_name)]})
+            return self._send(200, {"machines": [machine_obj(ARGS.machine_id, ARGS.machine_name)], "nextCursor": None})
 
         if path.startswith("/v1/machines/"):
             note(f"GET {path} 200")

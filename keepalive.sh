@@ -532,17 +532,42 @@ autoSuspendedAt=$(jget "$HTTP_BODY" autoSuspendedAt)"
 	return 0
 }
 
+# GET /v1/machines 是分页的。保留 machines_list 只解析当前页，
+# 这里负责把 nextCursor 逐页拉全，避免后续页机器漏保。
+# 官方运行时上限是 200；最多 20 页，防止异常 cursor 无限循环。
+machines_list_all() {
+	page=0
+	cursor=
+	while [ "$page" -lt 20 ]; do
+		page=$((page + 1))
+		if [ -n "$cursor" ]; then
+			if ! http GET "/v1/machines?limit=200&cursor=$cursor"; then
+				log "列机器失败 HTTP $HTTP_CODE: $HTTP_BODY"
+				return 1
+			fi
+		else
+			if ! http GET "/v1/machines?limit=200"; then
+				log "列机器失败 HTTP $HTTP_CODE: $HTTP_BODY"
+				return 1
+			fi
+		fi
+		machines_list || return 1
+		_cursor=$(jget "$HTTP_BODY" nextCursor)
+		# jget 会把 JSON null 读成字面量 "null"；它和空值都表示最后一页。
+		case "$_cursor" in ""|null) return 0 ;; esac
+		cursor=$_cursor
+	done
+	log "机器列表分页超过 20 页，已截断"
+	return 1
+}
+
 each_machine() { # each_machine <fn> —— 对选中的机器逐台执行
 	fn=$1
 	if [ "$ALL" -eq 0 ]; then
 		"$fn" "$MID" "$LABEL"
 		return $?
 	fi
-	if ! http GET "/v1/machines"; then
-		log "列机器失败 HTTP $HTTP_CODE: $HTTP_BODY"
-		return 1
-	fi
-	list=$(machines_list) || { log "解析机器列表失败"; return 1; }
+	list=$(machines_list_all) || { log "列机器失败或解析失败"; return 1; }
 	count=$(printf '%s\n' "$list" | grep -c . || true)
 	if [ "${count:-0}" -eq 0 ]; then
 		# 要区分两件事，否则会把正常情况报成故障：

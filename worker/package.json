@@ -1,11 +1,13 @@
 {
   "name": "instabox-keepalive-worker",
   "private": true,
+  "version": "2.3.1",
   "type": "module",
   "scripts": {
     "build": "node build.mjs",
     "test": "node test.mjs",
-    "dev": "node build.mjs && npx wrangler dev dist/worker.js",
-    "deploy": "npx wrangler deploy"
+    "dev": "node build.mjs && npx --yes wrangler@4.158.0 dev dist/worker.js",
+    "deploy": "node deploy.mjs",
+    "deploy:dry-run": "node deploy.mjs --allow-dirty --dry-run"
   }
 }

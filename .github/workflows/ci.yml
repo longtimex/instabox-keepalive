@@ -1,8 +1,8 @@
 name: ci
 
 # 一套工作流覆盖全部回归：
-#   unit        node 跑的 Worker 单测（123 项，进程内假 KV + 假 API + 假 Telegram）
-#   shell       keepalive.sh 的 shell 回归（26 项，node 假 API）
+#   unit        node 跑的 Worker 单测（171 项，进程内假 KV + 假 API + 假 Telegram）
+#   shell       keepalive.sh 的 shell 回归（27 项，node 假 API）
 #   alpine      同上，但在 BusyBox ash 里跑（VPS 上最常见的就是这种）
 #   integration tools/run_tests.sh（python 假 API，shell + worker 端到端）
 #   dist        构建产物是否与源码同步、是否被 Git 跟踪、是否被 .gitignore 误伤
@@ -105,6 +105,11 @@ jobs:
           git ls-files --error-unmatch worker/dist/worker.js \
             || (echo "::error::worker/dist/worker.js 没进版本库，网页面板就没法粘贴部署" && exit 1)
 
+      - name: 部署与监控脚本语法
+        run: |
+          node --check worker/deploy.mjs
+          node --check tools/healthcheck.mjs
+
       - name: 产物真的能被加载
         # build.mjs 是把 ui.js / telegram.js 内联进 worker.js，两个文件里同名
         # 的顶层 const 会在拼接后撞车（Identifier 'x' has already been declared）。
@@ -121,9 +126,9 @@ jobs:
         run: |
           bad=0
           for f in worker/ui.js worker/telegram.js worker/build.mjs worker/test.mjs worker/package.json \
-                   worker/dist/worker.js docs/panel.png docs/login.png \
+                   worker/dist/worker.js worker/deploy.mjs worker/wrangler.local.example.toml docs/panel.png docs/login.png \
                    test/shell.test.sh test/fake-api.mjs \
-                   tools/run_tests.sh tools/mock_api.py tools/worker_harness.mjs tools/check_sensitive.mjs \
+                   tools/run_tests.sh tools/mock_api.py tools/worker_harness.mjs tools/check_sensitive.mjs tools/healthcheck.mjs docs/MONITORING.md \
                    .github/workflows/ci.yml; do
             if git check-ignore -q "$f"; then
               echo "::error::$f 被 .gitignore 忽略了"

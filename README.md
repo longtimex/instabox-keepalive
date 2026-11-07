@@ -71,7 +71,7 @@ sh /root/instabox-keepalive/keepalive.sh uninstall   # 彻底卸载（停服务�
 | `INSTABOX_API_KEY` | 无（必填） | `ibk_...`，多把逗号分隔 |
 | `INSTABOX_MACHINE` | 空＝全部 | 机器名 / id / `all` |
 | `INSTABOX_LEASE` | `keepalive` | 租约名 |
-| `INSTABOX_LEASE_TTL` | `300` | 秒，30–3600；想更稳就填 `600`（见《怎么把保活成功率做到最高》） |
+| `INSTABOX_LEASE_TTL` | Worker `900` / 脚本 `300` | 秒，30–3600；Worker 默认 900 留出 3 倍 cron 余量，脚本想更稳可填 `600` |
 | `INSTABOX_RENEW_EVERY` | `0.6 × ttl` | 续租间隔，0–86400 秒（实际最小间隔 5 秒） |
 | `INSTABOX_AUTO_RESUME` | `1` | 遇 409 先按状态唤醒（wake / resume / start）再续；`0` 只报错不唤醒 |
 | `INSTABOX_WAKE_GAP` / `INSTABOX_WAKE_TRIES` | `5` / `6` | 等唤醒完成的总窗口 = 两者相乘（默认 30 秒，实际收敛到 5–55 秒）。由 operation 长轮询消耗，不再自己 sleep 轮询 |
@@ -180,12 +180,13 @@ docker compose run --rm instabox-keepalive --status
    | `TOKEN` | Secret（自己起一串随机值） | 脚本/curl 用的访问令牌；**也可以当面板密码用**（只配 TOKEN 时不校验用户名） |
    | `INSTABOX_MACHINE` | Text | 留空 = 保活该 key 名下全部机器；填 `qqq` 只保一台（多台用逗号分隔） |
    | `INSTABOX_LEASE` | Text | `keepalive`（可选） |
-   | `INSTABOX_LEASE_TTL` | Text | `900`（建议；不填默认 300，会比 cron 间隔小） |
+   | `INSTABOX_LEASE_TTL` | Text | `900`（Worker 默认也是 900，留出 3 倍 cron 余量） |
    | `INSTABOX_LOG_MODE` | Text | `hourly`（默认）/ `every` / `off`，控制写 KV 的频次 |
    | `INSTABOX_AUTO_RESUME` | Text | `1`（默认）。机器被平台挂起/停掉时，先按状态唤醒（`wake` / `resume` / `start`）再续租；设 `0` 只报错不唤醒 |
    | `ALERT_WEBHOOK` | Secret | 失败告警地址，续租失败/恢复时 POST 一条（不填就只写日志） |
    | `ALERT_FORMAT` | Text | `text`（默认）/ `feishu` / `dingtalk`（企业微信同款）/ `discord` |
    | `ALERT_MIN_INTERVAL` | Text | 同一故障最多多久发一次（默认 1800 秒） |
+   | `HEALTH_TOKEN` | Secret | 可选；外部监控用 `X-Health-Token` / `?health_token=` 只读访问 `/api/health` |
    | `INSTABOX_API_URL` | Text | `https://api.instabox.sh`（换私有网关时才用加这个变量） |
    | `ALLOW_PUBLIC` | Text | 没配密码时写接口默认被拒；确实想公开写才设 `1` |
    | `SUBREQUEST_LIMIT` | Text | 单次调用的子请求预算，默认 `45`（免费版上限 50），超了本轮提前收手 |
@@ -221,10 +222,10 @@ Worker 版自带面板，浏览器打开 `https://<你的worker>.workers.dev/ui`
 - **机器表格**：账号、机器名、`state`、租约剩余时间（每秒倒计时）、保活开关，以及单台的「续租 / 唤醒 / 释放」；冷却中的机器会在状态下面标出剩余分钟数
 - **保活开关**：关掉某台 = 下一轮 cron 不再给它续租，租约过期后按平台规则自动休眠；开着 = 一直续。开关显示的是**实际生效**的选中态：还没保存过面板配置时，它跟着 `INSTABOX_MACHINE` 走
 - **账号卡片**：key 打码、租约名、TTL、机器数，整账号开关 + 「全部保活 / 恢复默认」
-- **暂停保活**：一键停掉 cron 的全部续租（手动「全部续租」不受影响，方便临时操作）
+- **暂停保活**：一键停掉 cron 的全部续租（手动「全部续租」不受影响，方便临时操作）。暂停会记录 `pausedAt` / `pausedBy`，面板和 `/api/health` 会明确标为暂停，而不是显示正常运行
 - **最近日志**：读 `LOG` 里的最近记录
 - **Telegram 机器人**：填 token / secret / chat id，点「保存并注册」就把 webhook 和命令菜单一起配好，不用进 Cloudflare 后台（见下面的 [Telegram 机器人](#telegram-机器人手机开关机器)）
-- 自动刷新：有人操作时 20 秒一次，闲置后逐步退避到 60 秒，页面切到后台就完全停（倒计时是前端自己算的，不影响观感）；顶部会提示 `CONFIG` 没绑之类的降级状态
+- 自动刷新：有人操作时 30 秒一次，闲置后逐步退避到 90 秒，页面切到后台就完全停（服务端还有 10 秒短缓存；倒计时是前端自己算的，不影响观感）；顶部会提示 `CONFIG` 没绑之类的降级状态
 
 面板只是**覆盖层**，最终生效的规则是：
 
@@ -427,7 +428,7 @@ Worker 版自带面板，浏览器打开 `https://<你的worker>.workers.dev/ui`
 **已知取舍**（单人管理场景可接受）
 
 - KV 最终一致：跨地域写入最多约 60 秒才可见，面板上的「暂停 / 停用」可能延迟一轮生效
-- `updateConfig` 是读-改-写，两个标签页同时改可能互相覆盖；登录失败计数也不是原子操作
+- 同一 Worker isolate 内的配置和 live 写入已串行化；跨 isolate 仍是 KV 最终一致，多个管理员/标签页极端并发时仍可能互相覆盖。需要强一致时应迁到 Durable Object
 - 免费版单次调用 50 个子请求：`SUBREQUEST_LIMIT` 默认 45，超了本轮提前收手（日志会说「预算不够」），不会把整轮打挂
 - 会话是无状态签名 cookie：改密码或换 `SESSION_SECRET` 才会让旧会话失效，「退出」只清浏览器里那份
 - 子请求 / 时长都是平台硬限制，账号和机器很多时优先升级付费计划
@@ -508,7 +509,7 @@ key=ibk_xxx bash <(curl -Ls https://raw.githubusercontent.com/longtimex/instabox
 
 > 官方 schema 里 `PUT /activity-leases/{lease}` 的说明是「**waking an idle-suspended machine first**」—— 续租本身就会唤醒自己空闲挂起的机器。所以正常运行时根本走不到唤醒分支，只有手动 suspend / stopped 的机器才会触发 `machine_not_running`。
 
-**冷却（`machine_cooldown`）是另一回事**：机器连续运行到 `maxRunMinutes`（免费版固定 480 分钟）会被强制暂停，并进入 5–20 分钟冷却；免费版连着触发会升到 60–75 分钟、120–135 分钟。这期间任何唤醒方式都会被拒（`409 machine_cooldown` + `retryAfterSeconds`），只能等。
+**冷却（`machine_cooldown`）是另一回事**：活动租约只能防止空闲挂起，**不能延长 max-run**。Instabox 免费机每个新 run 初始给 2 小时，临近结束时按前 30 分钟的真实工作分钟数决定是否延长；续租 lease 和请求 wake 都不算工作，单个 run 最晚 8 小时暂停。max-run 暂停后进入 5–20 分钟冷却，免费版连续触发会升到 60–75 分钟、120–135 分钟。这期间任何唤醒方式都会被拒（`409 machine_cooldown` + `retryAfterSeconds`），只能等。需要 7×24 在线时应使用付费计划，而不是依赖 lease。
 
 冷却有两种，`cooldownReason` 能分开：
 
@@ -551,8 +552,9 @@ GET  /api/authinfo             要不要填用户名、走密码还是令牌（�
 POST /api/login                {"username":"admin","password":"...","remember":true,"next":"/ui"}
 POST /api/logout               清掉会话 cookie
 POST /api/account              改用户名/密码：{"currentPassword":"...","user":"admin","password":"新密码（留空不改）"}
-GET  /api/state?token=xxx      账号 + 全部机器 + 当前配置 + 最近续租时间 + 默认/单机区间状态（machines[].window）
-POST /api/config               改配置：{"window":{...}} 改默认，{"machine":{"account":1,"id":"m_x","window":{...}}} 改单机，window:null 恢复默认
+GET  /api/health?token=xxx     健康检查：正常 200；暂停 / 心跳过期 / 配置不可读返回 503 + reason；加 &deep=1 会额外验证真实 Instabox 机器列表合约
+GET  /api/state?token=xxx      账号 + 全部机器 + 当前配置 + 暂停来源/时间 + 最近续租时间 + 默认/单机区间状态（machines[].window）；&fresh=1 绕过 10 秒短缓存
+POST /api/config               改配置：{"window":{...}} 改默认，{"machine":{"account":1,"id":"m_x","window":{...}}} 改单机，window:null 恢复默认；暂停可带 pausedBy
                                window 里 ranges 是多段数组，如 [{"start":540,"end":720},{"start":840,"end":1080}]；旧的 {"start":480,"end":1380} 也认
                                也支持 {"paused":true} 和 {"accounts":{"2":{"enabled":true,"mode":"list","machines":["m_x"]}}}
 POST /api/telegram             配机器人：{"telegram":{"token":"…","secret":"…","chats":"1,2"},"register":true}
@@ -565,13 +567,34 @@ POST /api/log/clear            清空最近日志（只删 KV 里的历史记录
 
 身份可以是三种之一：**会话 cookie**（浏览器登录后自动带）、**`?token=`**、**`X-Token:` 请求头**（或 `Authorization: Bearer`）—— 脚本和 curl 走后面两种，完全不受登录页影响。不带 `format=text` 时返回 JSON，老路由都能加 `&format=text` 看纯文本。cron 跑的结果和 `/` 一样，也写进 `/log`（绑了 KV 才有），每条记着时间、租约、几台、每台到期时间；多账号时每台机器还带 `account` 编号（`1`、`2`…）。
 
+## 健康检查与暂停
+
+外部监控可设 `HEALTH_TOKEN` Secret，并用 `X-Health-Token` 或 `?health_token=` 调用；没配它时仍要求正常登录。
+
+`GET /api/health` 不调用 InstaBox API，因此探测本身不会续租、唤醒机器或消耗机器额度。它根据 `CONFIG` KV 的 `live` 心跳判断：
+
+| HTTP | status | 含义 |
+| --- | --- | --- |
+| 200 | `ok` | 最近一次成功续租在健康阈值内 |
+| 503 | `paused` | 全局暂停，cron 不会调用 InstaBox |
+| 503 | `stale` | cron 长时间没有执行，检查 Trigger / Worker 日志 / KV 写入 |
+| 503 | `no_recent_lease` | Worker 在跑，但当前没有有效 lease |
+| 503 | `limited` | 当前 lease 失效且机器受平台冷却、配额或 max-run 限制；按提示恢复，不要盲目重试 |
+| 503 | `account_read_failed` | 账号机器列表读取失败（鉴权/网络/分页）；状态不可信，不能当作保活成功 |
+| 503 | `degraded` | 配置不可读等基础故障 |
+| 503 | `contract_failed` | deep=1 时真实机器列表接口/响应结构与当前实现不兼容 |
+
+暂停时 `config` 会记录 `pausedAt` 和 `pausedBy`（`panel` / `telegram` / 自定义来源）。健康检查只有在 `CONFIG` 已绑定时才检查心跳；没绑 `CONFIG` 的纯环境变量部署仍能响应，但不会伪造持久化心跳。
+
+> 监控、真实 API 合约检查和告警配置见 [docs/MONITORING.md](docs/MONITORING.md)。
+
 ## KV 额度够不够
 
 免费版 KV 每天 1000 次写、10 万次读。默认 `hourly` 模式下，同一小时的连续成功只写 1 条：每天约 24 次写（失败会立刻写，不受去重影响），占额度 2.4%，怎么跑都不会满。手动 `/?token=` 触发一定写日志，不参与去重。
 
 多账号不会增加写次数：一条日志装的是所有账号的汇总，`hourly` 模式下仍然每小时最多 1 条，额度算法和单账号完全一样。KV 绑定名、namespace、`log` 这个 key 也都不用改。
 
-绑了 `CONFIG`（也就是用了面板）会多一笔：每轮 cron 写一次 `live` 快照（面板的「租约倒计时」靠它），`*/5` 就是 288 次/天，加上日志的 ~24 次约 312 次，占免费额度的 31%（这是上界：机器状态没变的那一轮不会写）。不绑 `CONFIG` 就没有这笔开销。
+绑了 `CONFIG`（也就是用了面板）会多一笔：每轮 cron 写一次 `live` 快照（面板的「租约倒计时」和健康检查靠它），`*/5` 就是 288 次/天，加上日志的 ~24 次约 312 次，占免费额度的 31%。不绑 `CONFIG` 就没有这笔开销。
 
 | cron 间隔 | 次数/天 | `every` 模式写/天 | `hourly` 模式写/天 |
 | --- | --- | --- | --- |
@@ -590,16 +613,17 @@ cd worker
 npx wrangler secret put INSTABOX_API_KEY       # 1 号账号（key 只进 secret，不写进 wrangler.toml）
 npx wrangler secret put INSTABOX_API_KEY_2     # 2 号账号，要几个加几个
 npx wrangler secret put TOKEN
-npx wrangler deploy
+npm run deploy:dry-run   # 安全预检，不上传
+npm run deploy           # 要求工作区已提交，自动 build + --keep-vars --strict
 ```
 
-`worker/wrangler.toml` 里已经设好 `crons = ["*/5 * * * *"]` 和 `INSTABOX_LEASE_TTL = "900"`，按需改就行。KV 绑定把文件末尾那两段 `[[kv_namespaces]]` 的注释去掉、填上 namespace id 再 `deploy`。
+`worker/wrangler.toml` 是共享模板，`crons = ["*/5 * * * *"]`、`INSTABOX_LEASE_TTL = "900"` 已设好。真实 KV ID 填在 `worker/wrangler.local.toml`（从 `wrangler.local.example.toml` 复制，已 gitignore）。`npm run deploy` 会先构建、检查工作区干净、确认 LOG/CONFIG 绑定存在，再用 `--keep-vars --strict` 部署。
 
 本地开发与自测（都不需要装依赖）：
 
 ```sh
 cd worker
-npm test          # 用假 KV + 假 API 跑一遍路由/配置/续租/区间/机器人逻辑（123 项）
+npm test          # 用假 KV + 假 API 跑一遍路由/配置/续租/区间/机器人/健康检查逻辑（171 项）
 npm run build     # 生成 dist/worker.js（面板 HTML 内联进去的单文件版）
 npx wrangler dev dist/worker.js    # 本地起一个，浏览器打开 http://localhost:8787/ui
 ```
@@ -607,7 +631,7 @@ npx wrangler dev dist/worker.js    # 本地起一个，浏览器打开 http://lo
 VPS 版也有一套可重复的测试（起假 API，不碰真实账号、不装服务）：
 
 ```sh
-sh test/shell.test.sh    # 26 项：.env 解析/注入防护/白名单/pretty JSON/卸载路径守卫/环境变量优先级/数值校验/信号退出
+sh test/shell.test.sh    # 27 项（新增分页校验）：.env 解析/注入防护/白名单/pretty JSON/卸载路径守卫/环境变量优先级/数值校验/信号退出
 ```
 
 两套测试都在 CI 里跑（`.github/workflows/ci.yml`），另外还会校验 `dist/worker.js` 是否和源码同步。

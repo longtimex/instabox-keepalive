@@ -1,0 +1,27 @@
+# 复制为 wrangler.local.toml，填入自己的 Cloudflare KV namespace ID。
+# wrangler.local.toml 已被 .gitignore 忽略，不应提交真实 ID。
+name = "instabox-keepalive"
+main = "worker.js"
+compatibility_date = "2026-10-16"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[vars]
+INSTABOX_MACHINE = ""
+INSTABOX_LEASE = "keepalive"
+INSTABOX_LEASE_TTL = "900"
+INSTABOX_LOG_MODE = "hourly"
+INSTABOX_AUTO_RESUME = "1"
+WAKE_TRIES = "6"
+WAKE_GAP = "5"
+ALERT_FORMAT = "text"
+ALERT_MIN_INTERVAL = "1800"
+
+[[kv_namespaces]]
+binding = "LOG"
+id = "<你的 KV namespace id>"
+
+[[kv_namespaces]]
+binding = "CONFIG"
+id = "<你的 KV namespace id>"

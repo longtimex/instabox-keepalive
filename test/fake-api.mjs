@@ -22,7 +22,9 @@ http
 
     if (key !== "ibk_good") return send(401, { error: "bad key" });
 
-    if (req.method === "GET" && req.url === "/v1/machines") return send(200, { machines });
+    if (req.method === "GET" && (req.url === "/v1/machines" || req.url.startsWith("/v1/machines?"))) {
+      return send(200, { machines, nextCursor: null });
+    }
 
     const one = /^\/v1\/machines\/([^/]+)$/.exec(req.url || "");
     if (req.method === "GET" && one) {

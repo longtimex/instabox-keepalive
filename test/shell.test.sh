@@ -206,6 +206,7 @@ else
 fi
 
 # 9) 环境变量优先于 .env（脚本头注释承诺的语义）
+# 同时用分页 stub 验证第二页机器也会续租。
 # .env 里是 machine=""（全部）+ ttl=300；环境变量给 machine=m_1 + ttl=600。
 # 用假 curl 记录实际请求：应该只 PUT m_1 且 ttlSeconds=600。
 logstub="$TMP/logstub"
@@ -215,7 +216,8 @@ cat >"$logstub/curl" <<'STUB'
 printf '%s\n' "$*" >>"$IBK_TEST_CURL_LOG"
 case "$*" in
 	*activity-leases*) printf '\n200' ;;
-	*"/v1/machines") printf '{"machines":[{"id":"m_1","name":"qqq"},{"id":"m_2","name":"box2"}]}\n200' ;;
+	*"/v1/machines?limit=200&cursor=2") printf '{"machines":[{"id":"m_2","name":"box2"}],"nextCursor":null}\n200' ;;
+	*"/v1/machines?limit=200") printf '{"machines":[{"id":"m_1","name":"qqq"}],"nextCursor":"2"}\n200' ;;
 	*) printf '\n200' ;;
 esac
 STUB
@@ -228,6 +230,30 @@ if grep -q 'ttlSeconds":600' "$TMP/curl.log" && grep -q '/m_1/activity-leases' "
 	ok "环境变量优先于 .env（machine / ttl）"
 else
 	bad "环境变量没有覆盖 .env：$(head -n 1 "$TMP/envprec.log")"
+fi
+
+# 9.1) 全部机器模式 + 分页：第一页 nextCursor 指向第二页，两页都要续租。
+stub2="$TMP/stub-page"
+mkdir -p "$stub2"
+cat >"$stub2/curl" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$*" >>"$IBK_TEST_CURL_LOG"
+case "$*" in
+	*activity-leases*) printf '\n200' ;;
+	*"/v1/machines?limit=200&cursor=2") printf '{"machines":[{"id":"m_2","name":"box2"}],"nextCursor":null}\n200' ;;
+	*"/v1/machines?limit=200") printf '{"machines":[{"id":"m_1","name":"qqq"}],"nextCursor":"2"}\n200' ;;
+	*) printf '\n200' ;;
+esac
+STUB
+chmod +x "$stub2/curl"
+: >"$TMP/curl-page.log"
+PATH="$stub2:$PATH" IBK_TEST_CURL_LOG="$TMP/curl-page.log" \
+	INSTABOX_ENV_FILE="$TMP/ok.env" INSTABOX_MACHINE=all \
+	sh "$SCRIPT" --once >"$TMP/page.log" 2>&1
+if grep -q '/m_1/activity-leases' "$TMP/curl-page.log" && grep -q '/m_2/activity-leases' "$TMP/curl-page.log" && grep -q 'cursor=2' "$TMP/curl-page.log"; then
+	ok "机器列表分页：两页都续租"
+else
+	bad "机器列表分页没有续租第二页：$(head -n 1 "$TMP/page.log")"
 fi
 
 # 10) 数值配置非法时要给明确错误，而不是算术报错后退出

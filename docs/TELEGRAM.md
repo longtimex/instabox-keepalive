@@ -99,8 +99,8 @@ https://<你的worker>.workers.dev/api/telegram?action=info&token=<你的TOKEN>
 | `/window [机器]` | 默认或单机保活区间（时间段 + 单次上限），见下节 |
 | `/keep <机器> on\|off` | 只切保活开关，不动机器 |
 | `/renew <机器>` | 手动续一次租约 |
-| `/release <机器>` | 放掉租约（到点就按平台规则空闲休眠）—— 不占菜单位，手打即可 |
-| `/pause on\|off` | 全局暂停/恢复 cron 保活（手动操作不受影响） |
+| `/release <机器>` | 放掉租约；若全局保活仍开着，下一轮 cron 会重新续租。不占菜单位，手打即可 |
+| `/pause on\|off` | 全局暂停/恢复 cron 保活。暂停记录来源和时间；手动 `/wake` `/renew` 仍可用，但 cron 不会接手 |
 | `/id` | 看当前聊天的 chat id |
 | `/help` | 帮助 |
 
@@ -144,6 +144,21 @@ https://<你的worker>.workers.dev/api/telegram?action=info&token=<你的TOKEN>
 
 不在时段是 `⏸ 现在不在区间内（北京时间 10:55）`，触顶是 `⏸ 本轮已保活 120 分钟，到 120 分钟上限了`。
 
+### 全局暂停与健康心跳
+
+Telegram 的列表摘要和暂停回执会显示：
+
+```text
+保活：⏸ 已全局暂停 · 2026-11-06 00:49（北京时间） · 来源 telegram
+⚠️ cron 不会调用 InstaBox；现有租约到期后机器会休眠
+
+保活：✅ 开着（1 台在保） · 最近成功续租 2026-11-07 11:45（北京时间）
+```
+
+`/pause on` 只停自动续租，手动 `/wake` 和 `/renew` 仍然可用。此时唤醒成功也会额外提示“全局保活仍暂停”，避免误以为 cron 会接手。`/pause off` 后下一轮 cron 自动续租，想立即恢复可发 `/renew 机器名`。
+
+`/renew`、`/wake` 成功后推进 `live.lastLeaseAt`；摘要会提示租约已过期或 2 分钟内到期的机器；`/release`、`/sleep`、`/stop` 释放租约后会清掉已经失效的心跳。`/api/health` 因此能区分“暂停 / 调度停摆 / 持续续租失败”。
+
 ### 唤醒走哪条路，是按官方文档分情况的
 
 | 机器状态 | 机器人实际发的请求 | 说明 |
@@ -156,7 +171,7 @@ https://<你的worker>.workers.dev/api/telegram?action=info&token=<你的TOKEN>
 
 ### 冷却：叫不醒是正常的
 
-机器连续运行到 `maxRunMinutes`（免费版固定 480 分钟 = 8 小时）会被平台强制暂停，并进入冷却：默认 5–20 分钟，免费版连着触发会升到 60–75 分钟、120–135 分钟。这期间**任何唤醒方式都会被拒**（`409 machine_cooldown`）。
+机器连续运行到 `maxRunMinutes` 会被平台强制暂停。免费机每个新 run 初始给 2 小时，按前 30 分钟的真实工作分钟数决定是否延长；续租和唤醒都不算工作，单个 run 最晚 8 小时暂停。之后进入冷却：默认 5–20 分钟，免费版连着触发会升到 60–75 分钟、120–135 分钟。这期间**任何唤醒方式都会被拒**（`409 machine_cooldown`）。
 
 冷却有两种，机器人会分开说：
 
@@ -208,6 +223,8 @@ https://<你的worker>.workers.dev/api/telegram?action=info&token=<你的TOKEN>
 - **不落 key**：机器人从 `env` 里拿 `INSTABOX_API_KEY`，不经过 KV、不进消息、不进日志
 - **永远回 200**：处理失败也回 200，否则 Telegram 会重投同一条更新，一次「关机」可能被执行好几次
 - **`/api/telegram` 要凭据**：没配 `ADMIN_PASSWORD`/`TOKEN` 时它跟其它写接口一样被拒（403），免得被人抢先注册 webhook
+- `/api/telegram` 的 `set` / `info` 响应会把 webhook URL 路径脱敏成 `/tg/***`；完整 secret 只用于向 Telegram 注册，不进入面板响应
+- Telegram 对 `429`、短暂 `5xx` 和网络错误最多自动重试一次；权限或参数类 `4xx` 不重试，避免制造重复消息
 - **面板里配 bot 的代价**：token 明文存在 `CONFIG` KV 里，能登录面板的人就能改它。也就是说**面板被攻破 ≈ 机器人被接管**（可以把 webhook 指到别处）。不过面板本来就能关机、改保活，危害等级是一样的 —— 真正的边界是面板密码本身。介意的话走方式 B，把 token 只放在环境变量里。
 
 ## 七、常见问题

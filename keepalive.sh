@@ -354,12 +354,12 @@ http() {
 	tries=0
 	while :; do
 		if [ -n "$data" ]; then
-			resp=$(curl -sS -m 30 --retry 2 --retry-delay 1 --retry-connrefused -X "$method" "$API$path" \
+			resp=$(curl -sS -m 30 --retry 2 --retry-delay 1 --retry-connrefused -X "$method" \
 				-K "$TMP_CFG" -H 'Content-Type: application/json' \
-				-d "$data" -w '\n%{http_code}' 2>&1) || { HTTP_CODE=0; HTTP_BODY=$resp; return 1; }
+				-d "$data" -w '\n%{http_code}' "$API$path" 2>&1) || { HTTP_CODE=0; HTTP_BODY=$resp; return 1; }
 		else
-			resp=$(curl -sS -m 30 --retry 2 --retry-delay 1 --retry-connrefused -X "$method" "$API$path" \
-				-K "$TMP_CFG" -w '\n%{http_code}' 2>&1) || { HTTP_CODE=0; HTTP_BODY=$resp; return 1; }
+			resp=$(curl -sS -m 30 --retry 2 --retry-delay 1 --retry-connrefused -X "$method" \
+				-K "$TMP_CFG" -w '\n%{http_code}' "$API$path" 2>&1) || { HTTP_CODE=0; HTTP_BODY=$resp; return 1; }
 		fi
 		HTTP_CODE=$(printf '%s' "$resp" | tail -n 1)
 		HTTP_BODY=$(printf '%s' "$resp" | sed '$d')
@@ -563,6 +563,7 @@ machines_list_all() {
 
 each_machine() { # each_machine <fn> —— 对选中的机器逐台执行
 	fn=$1
+	ensure_cfg
 	if [ "$ALL" -eq 0 ]; then
 		"$fn" "$MID" "$LABEL"
 		return $?
